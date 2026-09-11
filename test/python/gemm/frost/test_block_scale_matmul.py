@@ -41,7 +41,7 @@ from gemm_test_utils import (
 from cudnn.gemm.frost import compiler as C
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
-from cudnn.gemm.frost.graph_analyzer import analyze
+from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding
 from cudnn.gemm.frost.kernel_registry import GraphType, TEMPLATES, select_template
 from cudnn.gemm.frost.tile_config import (
     CATALOG,
@@ -108,6 +108,32 @@ def _build_nvfp4_graph(
         C.set_stride([M * N, 1, M])
     C.set_output(True).set_data_type(cudnn.data_type.HALF)
     return g
+
+
+def _build_one_sided_block_scale_graph(*, fake_a, raw_dt, scaled_dt, sf_dt, block_size):
+    """Dense GEMM with one real block_scale_dequantize and one raw FP8 side."""
+    M = N = 256
+    K = 512
+    sf_k = K // block_size
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.HALF,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=raw_dt if fake_a else scaled_dt)
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K], data_type=scaled_dt if fake_a else raw_dt)
+    sf_kw = dict(reordering_type=cudnn.tensor_reordering.F8_128x4)
+    if fake_a:
+        SF = g.tensor(name="SFB", dim=[1, sf_k, N], stride=[sf_k * N, 1, sf_k], data_type=sf_dt, **sf_kw)
+        lhs = A
+        rhs = g.block_scale_dequantize(input=B, descale=SF, block_size=[block_size, 1])
+    else:
+        SF = g.tensor(name="SFA", dim=[1, M, sf_k], stride=[M * sf_k, sf_k, 1], data_type=sf_dt, **sf_kw)
+        lhs = g.block_scale_dequantize(input=A, descale=SF, block_size=[1, block_size])
+        rhs = B
+    C = g.matmul(A=lhs, B=rhs, name="mm")
+    C.set_output(True).set_data_type(cudnn.data_type.HALF)
+    return g, A, B, SF, C
 
 
 def _build_block_scale_reduction_graph(
@@ -245,7 +271,7 @@ _DT_FP4, _DT_E4M3, _DT_E5M2, _DT_E8M0 = (
     cudnn.data_type.FP8_E5M2,
     cudnn.data_type.FP8_E8M0,
 )
-# (a_dt, sf_dt, b_dt, block_size) for the 6 supported cases.
+# (a_dt, sf_dt, b_dt, block_size) for the supported cases.
 _SUPPORTED_BS_CASES = [
     (_DT_FP4, _DT_E4M3, _DT_FP4, 16),  # 1 nvfp4
     (_DT_FP4, _DT_E8M0, _DT_FP4, 32),  # 2 mxfp4
@@ -264,6 +290,137 @@ def test_block_scale_matmul_gate_accepts_supported(a_dt, sf_dt, b_dt, bs):
     _check_block_scale_supported(chain, "sm100")
 
 
+@pytest.mark.parametrize("a_dt,b_dt", [(_DT_FP4, _DT_E4M3), (_DT_FP4, _DT_E5M2), (_DT_E4M3, _DT_FP4), (_DT_E5M2, _DT_FP4)])
+def test_block_scale_matmul_gate_accepts_mixed_mxfp8_mxfp4(a_dt, b_dt, monkeypatch):
+    from cudnn.gemm.frost import compiler as C
+
+    chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=_DT_E8M0, a_dt=a_dt, b_dt=b_dt))
+    C._check_block_scale_supported(chain, "sm100")
+    assert chain.block_scale.mma_block_scale_kind == "MXF8F6F4"
+    cfg32 = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg64 = by_name(_SM107_128 + "_1ctamma")
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    assert select_template(chain, cfg32).accepts(chain, cfg32) is None
+    src32 = C._render_block_scale_tile_constants(cfg32, chain, select_template(chain, cfg32))
+    assigned32 = dict(re.findall(r"^(\w+) = (.*)$", src32, re.M))
+    assert assigned32["a_smem_dtype"] == ("cutlass.Uint8" if a_dt == _DT_FP4 else C.DTYPE_TO_CUTLASS[_DTYPE_FROM_CUDNN[a_dt]])
+    assert assigned32["b_smem_dtype"] == ("cutlass.Uint8" if b_dt == _DT_FP4 else C.DTYPE_TO_CUTLASS[_DTYPE_FROM_CUDNN[b_dt]])
+    assert "Float4E2M1FN_unpack" not in src32
+    monkeypatch.setattr(C, "_current_arch", lambda: 107)
+    assert select_template(chain, cfg64).accepts(chain, cfg64) is None
+    src64 = C._render_block_scale_tile_constants(cfg64, chain, select_template(chain, cfg64))
+    assigned64 = dict(re.findall(r"^(\w+) = (.*)$", src64, re.M))
+    assert assigned64["a_smem_dtype"] == C.DTYPE_TO_CUTLASS[_DTYPE_FROM_CUDNN[a_dt]]
+    assert assigned64["b_smem_dtype"] == C.DTYPE_TO_CUTLASS[_DTYPE_FROM_CUDNN[b_dt]]
+
+
+@pytest.mark.parametrize("fake_a", [True, False], ids=["raw_fp8_a", "raw_fp8_b"])
+def test_one_sided_dequant_normalizes_to_existing_block_scale_case(fake_a):
+    g, A, B, SF, C_out = _build_one_sided_block_scale_graph(
+        fake_a=fake_a,
+        raw_dt=_DT_E4M3,
+        scaled_dt=_DT_E5M2,
+        sf_dt=_DT_E8M0,
+        block_size=32,
+    )
+    chain, binding = analyze_with_binding(g)
+    bs = chain.block_scale
+    assert bs is not None
+    assert (bs.fake_dequant_a, bs.fake_dequant_b) == ((True, False) if fake_a else (False, True))
+    assert (bs.block_size_a, bs.block_size_b) == ((1, 32), (32, 1))
+    assert (bs.sf_dtype_a, bs.sf_dtype_b) == ("fp8_e8m0", "fp8_e8m0")
+    assert (bs.sfa_reorder, bs.sfb_reorder) == ("F8_128x4", "F8_128x4")
+    assert binding.a_operands == [A]
+    assert binding.b_operands == [B]
+    assert binding.sfa_operands == ([] if fake_a else [SF])
+    assert binding.sfb_operands == ([SF] if fake_a else [])
+    assert binding.outputs == [C_out]
+    C._check_block_scale_supported(chain, "sm100")
+
+
+def test_one_sided_dequant_does_not_expand_the_registry_cases():
+    # Normalizing raw FP8 x NVFP4 creates a full per-side key, but that key is
+    # intentionally absent from _BLOCK_SCALE_CASES.  The fake mark must not
+    # bypass or broaden the existing support table.
+    g, *_ = _build_one_sided_block_scale_graph(
+        fake_a=True,
+        raw_dt=_DT_E4M3,
+        scaled_dt=_DT_FP4,
+        sf_dt=_DT_E4M3,
+        block_size=16,
+    )
+    chain = analyze(g)
+    assert chain.block_scale.fake_dequant_a
+    with pytest.raises(NotImplementedError, match="does not support this configuration"):
+        C._check_block_scale_supported(chain, "sm100")
+
+
+@requires_sm100
+@pytest.mark.parametrize("fake_a", [True, False], ids=["raw_fp8_a", "raw_fp8_b"])
+@pytest.mark.parametrize("scaled_kind", ["mxfp8", "mxfp4"])
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+        "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",
+        pytest.param(
+            "CONFIG_sm100_128x128x128_128x128x64_cluster1x1_1ctamma",
+            marks=requires_sm107,
+        ),
+        pytest.param(
+            "CONFIG_sm100_128x128x128_128x128x64_cluster2x1_2ctamma",
+            marks=requires_sm107,
+        ),
+    ],
+)
+def test_one_sided_dequant_e2e(fake_a, scaled_kind, config_name):
+    """The fake side consumes a persistent TMEM unity scale and no SF buffer."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    M = N = 256
+    K = 512
+    block_size = 32
+    raw_dt = cudnn.data_type.FP8_E4M3
+    scaled_dt = cudnn.data_type.FP8_E5M2 if scaled_kind == "mxfp8" else cudnn.data_type.FP4_E2M1
+    g, A, B, SF, C_out = _build_one_sided_block_scale_graph(
+        fake_a=fake_a,
+        raw_dt=raw_dt,
+        scaled_dt=scaled_dt,
+        sf_dt=cudnn.data_type.FP8_E8M0,
+        block_size=block_size,
+    )
+    compiled = _plan(g, config=by_name(config_name))
+    raw_a = (torch.randn(1, M, K, device=dev) * 0.25).to(torch.float8_e4m3fn)
+    raw_b = (torch.randn(1, N, K, device=dev) * 0.25).to(torch.float8_e4m3fn)
+    if scaled_kind == "mxfp8":
+        scaled_a = (torch.randn(1, M, K, device=dev) * 0.25).to(torch.float8_e5m2)
+        scaled_b = (torch.randn(1, N, K, device=dev) * 0.25).to(torch.float8_e5m2)
+        scaled_a_ref = scaled_a.float().view(M, K)
+        scaled_b_ref = scaled_b.float().view(N, K)
+    else:
+        lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+        scaled_a_u8 = torch.randint(0, 256, (1, M, K // 2), dtype=torch.uint8, device=dev)
+        scaled_b_u8 = torch.randint(0, 256, (1, N, K // 2), dtype=torch.uint8, device=dev)
+        scaled_a = scaled_a_u8.view(torch.float4_e2m1fn_x2)
+        scaled_b = scaled_b_u8.view(torch.float4_e2m1fn_x2)
+        scaled_a_ref = _unpack_fp4(scaled_a_u8, lut).view(M, K)
+        scaled_b_ref = _unpack_fp4(scaled_b_u8, lut).view(N, K)
+    a, b = (raw_a, scaled_b) if fake_a else (scaled_a, raw_b)
+    sf_log = _rand_e8m0((N if fake_a else M, K // block_size), dev)
+    sf = _to_blocked(sf_log).view(1, N if fake_a else M, K // block_size)
+    out = torch.empty(1, M, N, dtype=torch.float16, device=dev)
+    compiled({A: a, B: b, SF: sf, C_out: out})
+    torch.cuda.synchronize()
+
+    a_ref = raw_a.float().view(M, K) if fake_a else scaled_a_ref
+    b_ref = scaled_b_ref if fake_a else raw_b.float().view(N, K)
+    if fake_a:
+        b_ref = b_ref * sf_log.float().repeat_interleave(block_size, 1)
+    else:
+        a_ref = a_ref * sf_log.float().repeat_interleave(block_size, 1)
+    torch.testing.assert_close(out.float().view(M, N), a_ref @ b_ref.T, rtol=2e-2, atol=2e-1)
+
+
 def test_block_scale_matmul_gate_rejects_mismatches():
     from cudnn.gemm.frost.compiler import _check_block_scale_supported
 
@@ -273,7 +430,7 @@ def test_block_scale_matmul_gate_rejects_mismatches():
     # FP8 data at block 16 — the fp8 rows are block-32 only, on every pipeline.
     with pytest.raises(NotImplementedError, match="does not support"):
         _check_block_scale_supported(analyze(_build_nvfp4_graph(256, 256, 512, block_size=16, sf_dt=_DT_E8M0, a_dt=_DT_E4M3)), "sm100")
-    # mixed FP4 A / FP8 B (cross-family) — unsupported.
+    # Mixed width with a non-E8 scale has no mixed block-scale MMA encoding.
     with pytest.raises(NotImplementedError, match="does not support"):
         _check_block_scale_supported(
             analyze(
@@ -282,7 +439,7 @@ def test_block_scale_matmul_gate_rejects_mismatches():
                     256,
                     512,
                     block_size=32,
-                    sf_dt=_DT_E8M0,
+                    sf_dt=_DT_E4M3,
                     a_dt=_DT_FP4,
                     b_dt=_DT_E4M3,
                 )
@@ -406,7 +563,17 @@ def _make_block_scale_inputs(combo, M, N, K, dev="cuda"):
     return a_rt, b_rt, sfa_log, sfb_log, ref, bs, sf_dt, a_dt
 
 
-def _run_bs_numeric(combo, config_name, M, N, K, out_major="n"):
+def _splitk_workspace(compiled):
+    """(Workspace, buffer); the caller keeps both alive across the launch."""
+    from cudnn.frost.workspace import Workspace
+
+    if not compiled.workspace_bytes:
+        return None, None
+    buf = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+    return Workspace(buf, compiled.workspace_bytes, "test_block_scale_splitk"), buf
+
+
+def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force_stg=False):
     """Block-scale matmul vs a torch dequant-matmul reference."""
     dev = "cuda"
     torch.manual_seed(0)
@@ -438,8 +605,9 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n"):
         sfb_log = _rand_e8m0((N, sf_k), dev)
 
     g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=sf_dt, a_dt=a_dt, out_major=out_major)
-    compiled = _plan(g, **_kw(config_name))
+    compiled = _plan(g, config=dataclasses.replace(by_name(config_name), split_k_slices=split_k), force_stg_epi=force_stg)
     assert compiled.block_scale
+    ws, _ws_buf = _splitk_workspace(compiled)
     assert (compiled.chain.block_scale.sf_dtype, compiled.chain.block_scale.block_size) == (_DTYPE_FROM_CUDNN[sf_dt], bs)
 
     if out_major == "m":
@@ -458,7 +626,8 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n"):
             # pointer plus the layout it rebuilds from the problem size.
             _to_blocked(sfa_log).view(1, -(-M // 128) * 128, -1),
             _to_blocked(sfb_log).view(1, -(-N // 128) * 128, -1),
-        )
+        ),
+        workspace=ws,
     )
     torch.cuda.synchronize()
 
@@ -467,6 +636,36 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n"):
     ref = (a_s @ b_s.t()).to(torch.float16)
     # nvfp4 is bit-exact; mx paths carry fp16 rounding.
     torch.testing.assert_close(c[0], ref, atol=2e-1, rtol=2e-2)
+
+
+_SPLITK_BS_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "combo,config_name,S,out_major,force_stg",
+    [
+        ("nvfp4", _SPLITK_BS_CFG, 5, "n", False),
+        ("mxfp8", "CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma", 4, "n", False),
+        ("nvfp4", _SPLITK_BS_CFG, 2, "m", True),
+    ],
+    ids=("nvfp4-S5", "mxfp8-2ctamma-S4", "nvfp4-mmajor-stg-S2"),
+)
+def test_block_scale_matmul_splitk_numerics(combo, config_name, S, out_major, force_stg):
+    _run_bs_numeric(combo, config_name, 256, 256, 4096, out_major=out_major, split_k=S, force_stg=force_stg)
+
+
+def test_block_scale_splitk_auto_select_and_quant_reject():
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+
+    cfg = by_name(_SPLITK_BS_CFG)
+    # fp4 packs two K elements per byte: 4096 K = 2 KiB per row, 16 CTA-K tiles.
+    chain, _ = analyze_with_binding(_bs_chain("nvfp4", 256, 256, 4096))
+    assert C._auto_split_k(chain, cfg, sm_count=148).split_k_slices == 8
+    chain, _ = analyze_with_binding(_bs_chain("nvfp4", 256, 256, 2048))
+    assert C._auto_split_k(chain, cfg, sm_count=148).split_k_slices == 1
+    chain, _ = analyze_with_binding(_build_block_scale_quant_graph(256, 256, 4096))
+    assert "block-scale quantize" in C._splitk_reject_reason(chain, dataclasses.replace(cfg, split_k_slices=2))
 
 
 def _run_bs_nonpacked_numeric(combo, config_name, M, N, K, mode):
@@ -880,7 +1079,7 @@ def test_block_scale_matmul_nonpacked_tensors(combo, config_name, mode):
     _run_bs_nonpacked_numeric(combo, config_name, 256, 256, 512, mode)
 
 
-def _run_bs_reduction_numeric(combo, config_name, M, N, K, mode, red_dims, red_stride, ref_dims):
+def _run_bs_reduction_numeric(combo, config_name, M, N, K, mode, red_dims, red_stride, ref_dims, split_k=1):
     dev = "cuda"
     torch.manual_seed(0)
     a_rt, b_rt, sfa_log, sfb_log, ref, bs, sf_dt, a_dt = _make_block_scale_inputs(combo, M, N, K, dev)
@@ -895,8 +1094,9 @@ def _run_bs_reduction_numeric(combo, config_name, M, N, K, mode, red_dims, red_s
         a_dt=a_dt,
         red_stride=red_stride,
     )
-    compiled = _plan(g, **_kw(config_name))
+    compiled = _plan(g, config=dataclasses.replace(by_name(config_name), split_k_slices=split_k))
     assert compiled.block_scale and compiled.chain.reductions
+    ws, _ws_buf = _splitk_workspace(compiled)
 
     c_term = torch.empty(1, M, N, dtype=torch.float32, device=dev)
     if red_stride is None:
@@ -912,7 +1112,8 @@ def _run_bs_reduction_numeric(combo, config_name, M, N, K, mode, red_dims, red_s
             [c_term, c_red],
             _to_blocked(sfa_log).view(1, M, K // bs),
             _to_blocked(sfb_log).view(1, N, K // bs),
-        )
+        ),
+        workspace=ws,
     )
     torch.cuda.synchronize()
 
@@ -969,6 +1170,14 @@ def test_block_scale_matmul_reduction_scalar(mode, combo, config_name, M, N, K):
         red_dims=[1, 1, 1],
         red_stride=None,
         ref_dims=(0, 1, 2),
+    )
+
+
+@_GPU
+def test_block_scale_matmul_splitk_reduction():
+    """The reduction atomics run in the reducer, once per output element."""
+    _run_bs_reduction_numeric(
+        "nvfp4", _SPLITK_BS_CFG, 256, 256, 4096, cudnn.reduction_mode.AMAX, red_dims=[1, 1, 1], red_stride=None, ref_dims=(0, 1, 2), split_k=4
     )
 
 
@@ -1404,6 +1613,13 @@ def test_mma_gpu_arch_special_cases(monkeypatch):
     for ok_sm in (100, 110):
         monkeypatch.setattr(C, "_current_arch", lambda v=ok_sm: v)
         assert kr.mma_arch_reject(int8_chain, kr.GraphType.MATMUL, "sm100") is None
+    # Mixed MXFP8/MXFP4 is a baseline SM100 block-scale MMA encoding (K32); Rubin adds
+    # a K64 form, but the MMA type itself needs no narrow arch exception.
+    mixed_chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=_DT_E8M0, a_dt=_DT_FP4, b_dt=_DT_E4M3))
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    assert kr.mma_arch_reject(mixed_chain, kr.GraphType.BLOCK_SCALE_MATMUL, "sm100") is None
+    monkeypatch.setattr(C, "_current_arch", lambda: 107)
+    assert kr.mma_arch_reject(mixed_chain, kr.GraphType.BLOCK_SCALE_MATMUL, "sm100") is None
     # A family-portable combo is arch-free at this gate (stage 0 handles GPUs).
     bf16_chain = SimpleNamespace(matmul=SimpleNamespace(a_dtype="bf16", b_dtype="bf16", accum_dtype="fp32"))
     monkeypatch.setattr(C, "_current_arch", lambda: 90)
@@ -1482,7 +1698,7 @@ def test_sm103_rejects_misaligned_runtime_k(_pretend_sm103):
 # End-to-end numerics (sm103 GPU only)
 
 
-def _run_sm103_numeric(combo, config_name, M, N, K, cta_group=1):
+def _run_sm103_numeric(combo, config_name, M, N, K, cta_group=1, split_k=1):
     dev = "cuda"
     torch.manual_seed(0)
     bs = 16 if combo == "nvfp4" else 32
@@ -1506,9 +1722,10 @@ def _run_sm103_numeric(combo, config_name, M, N, K, cta_group=1):
         sfb_log = _rand_e8m0((N, sf_k), dev)
 
     g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=sf_dt, a_dt=a_dt)
-    compiled = _plan(g, **_sm103_kw(config_name, cta_group))
+    compiled = _plan(g, config=dataclasses.replace(by_name(config_name), cta_group=cta_group, split_k_slices=split_k))
     assert compiled.block_scale
     assert (compiled.chain.block_scale.sf_dtype, compiled.chain.block_scale.block_size) == (_DTYPE_FROM_CUDNN[sf_dt], bs)
+    ws, _ws_buf = _splitk_workspace(compiled)
 
     # The F8_128x4 reorder pads to 128-row × 4-SF blocks; view with the
     # padded dims (matters for M/N not multiples of 128).
@@ -1524,7 +1741,8 @@ def _run_sm103_numeric(combo, config_name, M, N, K, cta_group=1):
             c,
             _to_blocked(sfa_log).view(1, mp, kp),
             _to_blocked(sfb_log).view(1, np_, kp),
-        )
+        ),
+        workspace=ws,
     )
     torch.cuda.synchronize()
 
@@ -1566,6 +1784,19 @@ def test_sm103_block_scale_matmul_numerics(combo, config_name, shape):
 )
 def test_sm103_block_scale_matmul_numerics_2ctamma(combo, config_name, shape):
     _run_sm103_numeric(combo, config_name, *shape, cta_group=2)
+
+
+@requires_sm103
+@pytest.mark.parametrize(
+    "config_name,cta_group,shape,S",
+    [
+        (_CFG_128, 1, (256, 256, 4096), 3),  # partial K-tile lands in the last slice
+        ("CONFIG_sm103_128x256x384_128x256x48_cluster2x1", 2, (512, 512, 6144), 7),
+    ],
+    ids=("S3-partialK", "2ctamma-S7"),
+)
+def test_sm103_block_scale_matmul_splitk_numerics(config_name, cta_group, shape, S):
+    _run_sm103_numeric("nvfp4", config_name, *shape, cta_group=cta_group, split_k=S)
 
 
 @requires_sm103
@@ -1788,6 +2019,81 @@ def test_k64_is_rejected_on_older_blackwell(monkeypatch):
 )
 def test_sm107_block_scale_matmul_numerics(combo, config_name, cta_group):
     _run_bs_numeric(combo, config_name, 256, 256, 512)
+
+
+@requires_sm100
+@pytest.mark.parametrize("fp8_on_a", [True, False], ids=["mxfp8_x_mxfp4", "mxfp4_x_mxfp8"])
+@pytest.mark.parametrize("fp8_torch_dt,fp8_cudnn_dt", [(torch.float8_e4m3fn, _DT_E4M3), (torch.float8_e5m2, _DT_E5M2)])
+@pytest.mark.parametrize("fp8_mn_major", [False, True], ids=["k_major", "mn_major"])
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+        "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
+        pytest.param(_SM107_128 + "_1ctamma", marks=requires_sm107),
+        pytest.param("CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma", marks=requires_sm107),
+    ],
+)
+def test_mixed_mxfp8_mxfp4_numerics(fp8_on_a, fp8_torch_dt, fp8_cudnn_dt, fp8_mn_major, config_name):
+    """K32 padded and Rubin K64 native-packed mixed block-scale MMA, both operand orders."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    M = N = 256
+    K = 512
+    bs = 32
+    sf_k = K // bs
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+
+    fp8_a = (torch.randn(1, M, K, device=dev) * 0.5).to(fp8_torch_dt)
+    fp8_b = (torch.randn(1, N, K, device=dev) * 0.5).to(fp8_torch_dt)
+    fp4_a_u8 = torch.randint(0, 256, (1, M, K // 2), dtype=torch.uint8, device=dev)
+    fp4_b_u8 = torch.randint(0, 256, (1, N, K // 2), dtype=torch.uint8, device=dev)
+    fp4_a = fp4_a_u8.view(torch.float4_e2m1fn_x2)
+    fp4_b = fp4_b_u8.view(torch.float4_e2m1fn_x2)
+
+    if fp8_on_a:
+        a_rt, a_ref, a_dt = fp8_a, fp8_a.float().view(M, K), fp8_cudnn_dt
+        b_rt, b_ref, b_dt = fp4_b, _unpack_fp4(fp4_b_u8, lut).view(N, K), _DT_FP4
+        if fp8_mn_major:
+            a_rt = a_rt.transpose(1, 2).contiguous().transpose(1, 2)
+    else:
+        a_rt, a_ref, a_dt = fp4_a, _unpack_fp4(fp4_a_u8, lut).view(M, K), _DT_FP4
+        b_rt, b_ref, b_dt = fp8_b, fp8_b.float().view(N, K), fp8_cudnn_dt
+        if fp8_mn_major:
+            b_rt = b_rt.transpose(1, 2).contiguous().transpose(1, 2)
+
+    sfa_log = _rand_e8m0((M, sf_k), dev)
+    sfb_log = _rand_e8m0((N, sf_k), dev)
+    g = _build_nvfp4_graph(
+        M,
+        N,
+        K,
+        block_size=bs,
+        sf_dt=_DT_E8M0,
+        a_dt=a_dt,
+        b_dt=b_dt,
+        a_major="m" if fp8_on_a and fp8_mn_major else "k",
+        b_major="n" if not fp8_on_a and fp8_mn_major else "k",
+    )
+    compiled = _plan(g, **_kw(config_name))
+    assert compiled.chain.block_scale.mma_block_scale_kind == "MXF8F6F4"
+
+    c = torch.zeros(1, M, N, dtype=torch.float16, device=dev)
+    compiled(
+        _vp_bs(
+            compiled,
+            a_rt,
+            b_rt,
+            c,
+            _to_blocked(sfa_log).view(1, M, sf_k),
+            _to_blocked(sfb_log).view(1, N, sf_k),
+        )
+    )
+    torch.cuda.synchronize()
+
+    a_deq = a_ref * sfa_log.float().repeat_interleave(bs, 1)
+    b_deq = b_ref * sfb_log.float().repeat_interleave(bs, 1)
+    torch.testing.assert_close(c[0], (a_deq @ b_deq.t()).to(torch.float16), atol=2e-1, rtol=2e-2)
 
 
 @requires_sm107
@@ -2387,6 +2693,7 @@ def test_sm120_block_scale_registry_wiring():
     # Only the active-GPU gates may refuse -- the family range (sm < 100) or the
     # block-scale MMA special case (100 <= sm < 120) -- never the wiring itself.
     assert reason is None or "runs only on" in reason or "exists only on 120 <= SM < 130" in reason, reason
+
     # fp4 + e8m0 at block 16 is refused by the MMA-type table ...
     chain16 = analyze(_build_nvfp4_graph(256, 256, 512, block_size=16, sf_dt=cudnn.data_type.FP8_E8M0))
     assert "does not support" in mma_arch_reject(chain16, GraphType.BLOCK_SCALE_MATMUL, "sm120")
@@ -2398,6 +2705,37 @@ def test_sm120_block_scale_registry_wiring():
         _build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3, a_major="m", b_major="n")
     )
     assert tmpl._extra_reject(chain_mn, cfg) is None
+
+
+@pytest.mark.parametrize("fake_a", [True, False], ids=["raw-a", "raw-b"])
+def test_sm120_rejects_one_sided_mxfp8_without_identity_scale(fake_a):
+    """The normalized MMA key stays generic, but sm120 cannot yet materialize
+    the fake side's all-one scale factors required by a one-sided graph."""
+    from cudnn.gemm.frost.kernel_registry import mma_arch_reject
+
+    g, *_ = _build_one_sided_block_scale_graph(
+        fake_a=fake_a,
+        raw_dt=cudnn.data_type.FP8_E4M3,
+        scaled_dt=cudnn.data_type.FP8_E5M2,
+        sf_dt=cudnn.data_type.FP8_E8M0,
+        block_size=32,
+    )
+    chain = analyze(g)
+
+    # This is still an existing block-scale MMA combination.  sm100 supports
+    # the renderer-level fake-dequant path; sm120 must fail before it indexes a
+    # missing scale-factor descriptor.
+    assert mma_arch_reject(chain, GraphType.BLOCK_SCALE_MATMUL, "sm100") is None
+    reason = mma_arch_reject(chain, GraphType.BLOCK_SCALE_MATMUL, "sm120")
+    assert reason is not None
+    assert "one-sided dequantization" in reason
+    assert "identity handling is not implemented" in reason
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(C, "_current_arch", lambda: 120)
+        assert _sm120_bs_template().accepts(chain, by_name(_SM120_BS_128)) == reason
+        with pytest.raises(NotImplementedError, match="one-sided dequantization"):
+            jit_from_cudnn_graph(g, config=by_name(_SM120_BS_128))
 
 
 def test_sm120_block_scale_config_rules():
@@ -2514,6 +2852,16 @@ def test_sm120_block_scale_tile_constants_render(combo, kind, vec, fmt, ptx):
 )
 def test_sm120_block_scale_matmul_numerics(combo, config_name, M, N, K):
     _run_bs_numeric(combo, config_name, M, N, K)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "combo,config_name,S,M,N,K",
+    [("nvfp4", _SM120_BS_128, 5, 256, 256, 4096), ("mxfp8", _SM120_BS_128_W24, 3, 512, 384, 1088)],  # the second: 8.5 K-tiles over 3 slices
+    ids=("nvfp4-S5", "mxfp8-w24-ktail-S3"),
+)
+def test_sm120_block_scale_matmul_splitk_numerics(combo, config_name, S, M, N, K):
+    _run_bs_numeric(combo, config_name, M, N, K, split_k=S)
 
 
 @requires_sm120

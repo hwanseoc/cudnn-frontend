@@ -150,6 +150,10 @@ _BLOCK_SCALE_CASES = frozenset(
         _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
         _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
         _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
+        _bs_key("fp4_e2m1", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
+        _bs_key("fp4_e2m1", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
+        _bs_key("fp8_e4m3", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),
+        _bs_key("fp8_e5m2", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),
     }
 )
 
@@ -258,6 +262,19 @@ def mma_arch_reject(chain: FusionChain, graph_type: GraphType, template_pipeline
             mm = chain.matmul
             return f"the {template_pipeline} {graph_type.value} pipeline does not support " f"input/acc dtype combo {mm.a_dtype}x{mm.b_dtype}->{mm.accum_dtype}"
         return f"the {template_pipeline} {graph_type.value} pipeline does not support " f"this configuration: mma type {key}"
+    # One-sided block-scale graphs are normalized to an ordinary two-sided MMA
+    # type, with the raw FP8 operand carrying a fake-dequant marker.  Keep that
+    # marker out of the generic MMA-type key: it is a renderer capability, not a
+    # new instruction combination.  The sm120 renderer does not yet synthesize
+    # the identity scale-factor operand, however, and unconditionally indexes
+    # both TMA descriptor lists.  Reject it here before rendering/compilation.
+    if (
+        template_pipeline == "sm120"
+        and base_type is GraphType.BLOCK_SCALE_MATMUL
+        and chain.block_scale is not None
+        and (chain.block_scale.fake_dequant_a or chain.block_scale.fake_dequant_b)
+    ):
+        return "the sm120 block_scale_matmul pipeline does not support one-sided " "dequantization: fake scale-factor identity handling is not implemented"
     special = MMA_GPU_ARCH_SPECIAL_CASES.get((template_pipeline, key))
     if special is not None:
         arch = C._current_arch()
@@ -348,7 +365,7 @@ class KernelTemplate:
 
                 bs = chain.block_scale
                 assert bs is not None
-                data_elem_bits = 4 if bs.is_fp4 else 8
+                data_elem_bits = max(C.DTYPE_BITS[bs.a_dtype], C.DTYPE_BITS[bs.b_dtype])
                 cta_k_elems = config.cta_tile_k_bytes * 8 // data_elem_bits
                 validate_block_scale_config(config, bs.block_size, cta_k_elems)
             else:

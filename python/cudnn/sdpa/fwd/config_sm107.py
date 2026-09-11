@@ -75,11 +75,14 @@ __all__ = [
     "make_cfg_d128",
     "make_cfg_d128_mxfp8",
     "make_cfg_d192",
+    "make_cfg_d192_mxfp8",
     "make_cfg_d256",
     "make_cfg_d256_mxfp8",
     "make_cfg_d512",
     "make_cfg_d512_mxfp8",
     "SMEM_CAP_BYTES",
+    "SM107_FP8_THD_SHAPES",
+    "SM107_F16_THD_SHAPES",
 ]
 
 
@@ -92,7 +95,7 @@ __all__ = [
 # and the d256/d512 flavors all depend on it.
 SMEM_CAP_BYTES = 327 * 1024
 
-# ...but the CAPACITY is not the budget. The shipped prefill_d128_fp8_sm107.py
+# ...but the CAPACITY is not the budget. The shipped sm107/prefill_d128_fp8.py
 # sizes its own guard against 320 KiB ("327 KiB capacity minus reserves"), and
 # the kernels additionally spend ~2 KiB on barriers, the scheduler ring and the
 # TMEM pointer. Validating Q/K/V/O against the raw 327 KiB waves through an
@@ -108,6 +111,42 @@ _SMEM_FIXED_OVERHEAD = 2 * 1024  # barriers + scheduler + tmem-ptr slack
 TMEM_TOTAL_COLS = 576
 
 _DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16 = 0, 1, 2, 3
+
+# Head-dim shapes whose Rubin PER-TENSOR FP8 kernel carries the THD/varlen leg.
+#
+# ONE definition, consumed by BOTH the engine row (`engines._sm100_fp8_spec`'s
+# ``thd_d_shapes`` on the Rubin arm) and the standalone adapter's THD gate
+# (``api_dsl.SdpaFwdDslSm100.check_support``).  They are two enforcement points
+# for one fact, and contract rule 8b' exists because keeping two copies in step
+# by hand does not work: widen only the row and a graph enters the ranked list
+# then dies with a bare NotImplementedError in check_support; widen only the
+# wrapper and the row still declines.  Sharing the constant makes disagreement
+# unrepresentable rather than merely tested.
+#
+# Membership rule: the shape's body must carry the FROST THD contract -- the
+# 14-arg build_thd_meta_o_descs_kernel, 4B+4 metadata, (b+3) O-descriptor slots,
+# the persistent claim-counter scheduler, the dead-unit O-store guard and the
+# packed-total-clamped runtime K/V descriptors.
+#
+# All four qualify as of 2026-09-09.  d192xd128 came free -- it IS the shipped
+# d128 body, only the config factory differs -- and d256 / d512 were moved onto
+# the contract (frost_dev/port_thd_contract.py); they previously called the
+# setup kernel with the pre-upstream 7-arg signature and allocated 3B+2 where
+# the shared decode reads 4B+4.  Confirmed on w2u1g-lc-0030: 43 passed / 0
+# failed across the per-tensor FP8 THD suite.
+SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+
+# f16/bf16 flavor names whose kernel body HAS been ported to the FROST
+# setup-kernel contract (the 14-arg build_thd_meta_o_descs_kernel + the 4B+4
+# metadata the shared decode reads).  Keyed by the `flavor` string
+# `_validate_params` already receives, so adding a ported flavor is one entry.
+_F16_THD_FLAVORS = frozenset({"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm107 d512"})
+
+# Head-dim shapes whose Rubin f16/bf16 kernel carries the THD/varlen leg -- the
+# same one-definition-two-consumers arrangement as SM107_FP8_THD_SHAPES above
+# (engine row + standalone adapter gate; contract rule 8b').  Must stay in step
+# with _F16_THD_FLAVORS, which is the same fact keyed by config-flavor name.
+SM107_F16_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 
 
 # ---------------------------------------------------------------------------
@@ -233,9 +272,17 @@ def _mask_flags_from(params: TemplateParams) -> int:
     return flags
 
 
-def _validate_params(flavor: str, k: TemplateParams) -> None:
+def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = False) -> None:
     """Guard the TemplateParams a Rubin flavor can express. Every rejection here
-    must also be a Capabilities decline — reaching this is an engine-row bug."""
+    must also be a Capabilities decline — reaching this is an engine-row bug.
+
+    ``split_wired`` says whether THIS flavor's kernel carries make_split_helpers.
+    It is per-flavor rather than blanket because exactly one Rubin kernel does:
+    prefill_d128_fp8_sm107.py, which was ported from its SM100 twin before the
+    other nine siblings existed. Rejecting the split for that one contradicted
+    the engine row, which advertises split_d_shapes={(128, 128)} — so a long-KV
+    Rubin graph could be handed an automatically proposed split plan and then
+    fail here at compile."""
     if k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16):
         raise ValueError(f"{flavor}: dtype_qkv must be 0=E4M3/1=E5M2/2=BF16/3=FP16 (got {k.dtype_qkv}); Rubin has no TF32 prefill kernel")
     dtype_o = resolve_dtype_o(k)
@@ -247,15 +294,21 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: sched_policy must be NATURAL/LPT/LPT_L2 or None (got {k.sched_policy})")
     if k.qh_per_kh < 1:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
-    if k.split_kv and k.split_kv > 1:
-        raise ValueError(f"{flavor}: split_kv > 1 is not wired in the SM107 kernels (no SplitHelpers)")
-    # FP8/MXFP8 only.  The f16/bf16 Rubin kernels carry no varlen plumbing --
-    # their setup-kernel call site still speaks the pre-upstream 7-arg contract
-    # against a 14-arg helper, and the metadata layout differs (3B+2 vs 4B+4).
-    # (This guard used to repeat the same dtype set the check above already
-    # enforces, so it declined nothing.)
-    if k.thd_varlen and k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2):
-        raise ValueError(f"{flavor}: THD/varlen is FP8/MXFP8 only on SM107 (got dtype_qkv={k.dtype_qkv}); the f16/bf16 kernels carry no varlen plumbing")
+    if k.split_kv and k.split_kv > 1 and not split_wired:
+        raise ValueError(f"{flavor}: split_kv > 1 is not wired in this SM107 kernel (no SplitHelpers)")
+    # THD/varlen is per-FLAVOR on the Rubin line, not per-dtype.  Every
+    # QUANTIZED flavor carries it; on the f16/bf16 side only the flavors whose
+    # BODY has been ported to the FROST setup-kernel contract do -- the rest
+    # still call it with the pre-upstream 7-arg signature against a 14-arg
+    # helper, and allocate the 3B+2 metadata buffer where the SHARED decode
+    # (_common_blackwell._thd_decode) reads 4B+4 with a batch_remap.  That
+    # mismatch is a HANG or a wrong batch, not an arity error, so it is declined
+    # here rather than left to fail deep in a trace.
+    if k.thd_varlen and k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2) and flavor not in _F16_THD_FLAVORS:
+        raise ValueError(
+            f"{flavor}: THD/varlen on the SM107 f16/bf16 line is served by {sorted(_F16_THD_FLAVORS)} only "
+            f"(got dtype_qkv={k.dtype_qkv}); the other flavors' setup-kernel call sites are not ported"
+        )
 
 
 def _band_fields(params: TemplateParams) -> Tuple[int, int, int, int, int]:
@@ -537,7 +590,7 @@ def _stages_kv_d128(dtype_qkv: int, cta_mma: int, *, mxfp8: bool, tile_k: int) -
     """Rubin d128-family ring depth.
 
     Per-tensor FP8 at d128/cga2 runs a **9-stage** ring: a Rubin-specific tuning
-    carried by the shipped ``prefill_d128_fp8_sm107.py`` (which previously spelled
+    carried by the shipped ``sm107/prefill_d128_fp8.py`` (which previously spelled
     it as a post-hoc ``dataclasses.replace``), and the reason that kernel needs
     the oversized-SMEM launch mode.
 
@@ -561,7 +614,15 @@ def _stages_kv_d128(dtype_qkv: int, cta_mma: int, *, mxfp8: bool, tile_k: int) -
 
 
 def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, tile_o: int, mxfp8: bool):
-    _validate_params(flavor, params)
+    # Per-tensor FP8 d128 is the Rubin cell the engine row's split_d_shapes
+    # names, and the gate tracks the ROW rather than merely "has SplitHelpers":
+    # sm107/prefill_d192_d128_fp8 wires them too, but the row does not advertise
+    # it and its body carries no o_partial_f32 slot, so a split there would be
+    # untested capability. This entry point also serves the d128 HALF kernel and
+    # (at tile_k=192) the d192 one -- hence the dtype and tile checks rather than
+    # keying on the flavor string.
+    split_wired = not mxfp8 and tile_k == 128 and tile_o == 128 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
+    _validate_params(flavor, params, split_wired=split_wired)
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
@@ -642,7 +703,35 @@ def make_cfg_d128_mxfp8(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
 
 
 def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
+    """d_qk=192 / d_v=128, f16 and per-tensor FP8.
+
+    Same family as ``make_cfg_d128`` with a wider K: the pre-upstream base kernel
+    was flavor-generic (one body served d128 and d192xd128 by swapping the config),
+    and ``CfgD192`` only widens ``TILE_K``.
+    """
     return _make_cfg_d128_family(params, flavor="sm107 d192xd128", tile_k=192, tile_o=128, mxfp8=False)
+
+
+def make_cfg_d192_mxfp8(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
+    """d_qk=192 / d_v=128, block-scale MXFP8.
+
+    CGA2 ONLY, and that is a DESCRIPTOR constraint rather than a tuning choice.
+    At ``cta_mma=1`` the K/V rings are not halved, so the four scale-factor tiles
+    -- allocated last -- start at 256/258/276/278 KiB, i.e. past the **256 KiB
+    version-0 tcgen05 descriptor window**.  A version-0 SF descriptor there wraps
+    to offset 0 and the UTCCP copies Q DATA bytes into the SF TMEM columns:
+    ``LSE = +inf`` and ``O = NaN`` on 100 % of cells, at every shape (the exact
+    d512 MXFP8 failure in rules/mma-tma-matrix.md S6).  At ``cta_mma=2`` the
+    highest slab sits at 200 KiB and version 0 is provably safe.
+
+    So the Rubin MXFP8 engine row deliberately declares NO ``cgas_by_d_shape``
+    entry for (192, 128), leaving it on the row default ``cgas={2}``.  Lifting
+    that needs ``DESC_VERSION`` derived from the layout AND the version-1 SF path
+    validated on Rubin -- which is NOT a free widening: setting
+    ``desc_version=1`` on the d128/d256 MXFP8 tiles turned 21 green tests red
+    (2026-09-08), so the bit is not a transparent superset.
+    """
+    return _make_cfg_d128_family(params, flavor="sm107 d192xd128 mxfp8", tile_k=192, tile_o=128, mxfp8=True)
 
 
 # ---------------------------------------------------------------------------
@@ -667,26 +756,34 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
     tile_k = tile_o = 256
     tile_n = 128
-    # STAGES_KV is a BODY CONSTRAINT here, not a tuning knob -- pin it to 2.
+    # STAGES_KV is a TUNING KNOB again (2..4), and the note that said otherwise
+    # was WRONG about why.
     #
-    # This pipeline runs a Q.K(i+1) -> S.V(i) lookahead against TWO parity
-    # S_acc TMEM slots, and the body conflates the KV ring index with that
-    # parity.  At depth 2 the two coincide and everything is consistent; at
-    # depth 4 they diverge and the MMA consumes the wrong K/V tile from the
-    # third KV iteration onward -- the first time parity slot 0 is REUSED.
+    # It used to be pinned to 2, blaming a body that "conflates the KV ring
+    # index with the 2-slot S_acc parity". That diagnosis does not survive
+    # reading the body: every parity site derives parity from the ABSOLUTE
+    # `kv_loop & 1`, and K/V ride separate PipelineStates advanced in lockstep
+    # with the TMA warp, so the body is depth-agnostic.
     #
-    # Measured on Rubin (d256 FP8 e4m3, cos vs an fp32 reference), n_kv =
-    # 2/3/4/8:  depth 4 -> 0.9996 / 0.6493 / 0.5448 / --  ;
-    #           depth 2 -> 0.9996 / 0.9996 / 0.9996 / 0.9997.
-    # The f16 sibling breaks identically at depth 4, which is how this was
-    # caught: it had been green at depth 2 and regressed when the SM107 config
-    # first adopted the pre-upstream value of 4 wholesale.
+    # The real cause was the >256 KiB tcgen05 descriptor wrap. Buffers are laid
+    # out sQO | sK[stages] | sV[stages]; at depth 4 the last two V stages start
+    # at 256 KiB and 288 KiB, and a VERSION-0 descriptor truncates
+    # `start_address` to 14 bits, so those stages alias the bottom of SMEM. The
+    # answer goes wrong from the KV iteration that first touches a wrapped
+    # stage -- which is why it looked like a ring bug and why it only shows up
+    # at S_kv > 256.
     #
-    # So do NOT "restore" 4 to match the pre-upstream config or to deepen the
-    # ring for latency -- that is a silent-wrong-answer change, and it only
-    # shows up at S_kv > 256.  Deepening it needs the body's parity indexing
-    # decoupled from the ring index first.
-    stages_kv = 2
+    # Measured on Rubin, d256 f16, cos vs an fp32 reference, n_kv = 2/3/4/8:
+    #   depth 4, desc v0:  1.0000 / 0.6806 / 0.4980 / 0.4640   <- the old data
+    #   depth 4, desc v1:  1.0000 / 1.0000 / 1.0000 / 1.0000   dense AND causal
+    #   depth 3, desc v0:  1.0000 / 1.0000 / 1.0000 / 1.0000   (stays under)
+    # `prefill_d256_f16.DESC_VERSION` is now DERIVED from the layout, so any
+    # depth that fits SMEM is correct by construction. Do not re-literal it.
+    # `is not None`, NOT a truth test: a truthiness check maps an explicit
+    # stages_kv=0 onto the default 2, which is a knob SUBSTITUTION -- the one
+    # thing the engine contract forbids (honored or ineligible). Out-of-domain
+    # values must reach the 2..4 check below and raise there.
+    stages_kv = params.stages_kv if getattr(params, "stages_kv", None) is not None else 2
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
     arrivers = _d256_read_tile_arrivers(cta_mma)
 
@@ -755,10 +852,10 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
             (cfg.TILES_Q == 1, f"{flavor}: the d256 pipeline mandates TILES_Q == 1"),
             (cfg.SOFTMAX_WARPGROUPS == 1, f"{flavor}: the d256 pipeline mandates SOFTMAX_WARPGROUPS == 1"),
             (
-                cfg.STAGES_KV == 2,
-                f"{flavor}: the d256 body ties its KV ring index to the 2-slot S_acc parity, so "
-                f"STAGES_KV must be 2 (got {cfg.STAGES_KV}); a deeper ring returns WRONG RESULTS "
-                f"from the third KV iteration on, silently, and only at S_kv > 256",
+                2 <= cfg.STAGES_KV <= 4,
+                f"{flavor}: STAGES_KV must be in 2..4 (got {cfg.STAGES_KV}); the upper bound is the "
+                f"{SMEM_USABLE_BYTES // 1024} KiB Rubin carveout, and the kernel derives its tcgen05 "
+                f"descriptor version from the resulting layout so every depth in range is correct",
             ),
         ]
     )
