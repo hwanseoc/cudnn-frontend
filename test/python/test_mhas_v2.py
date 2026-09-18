@@ -188,6 +188,7 @@ def test_sdpa_random_bwd_L0(env_info, test_no, request, cudnn_handle):
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 4, "full" : 1}),
         is_deterministic=RandomChoice({True : 3, False : 1}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
+        with_stats_log2=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
@@ -221,7 +222,9 @@ def test_sdpa_random_sq1_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
+        # ragged = packed-THD decode (the serving shape); was never drawn here,
+        # which is how the d=192 THD-decode view overflow (GitHub #980) hid.
+        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 1, "full" : 1}),
         # sink_token not supported with s_q==1
         # dropout not supported with s_q==1
     ) as randomization_ctx:
@@ -264,6 +267,125 @@ def test_sdpa_random_sq1_unified_L1(env_info, test_no, request, cudnn_handle):
     exec_sdpa(test.cfg, request, cudnn_handle)
 
 
+# fmt: on
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(cudnn.backend_version() < 92400, reason="ragged offset multiplier requires cuDNN >= 9.24")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("offset_dtype,use_multiplier", [(torch.int32, True), (torch.int64, False)], ids=["int32_tokens", "int64_elements"])
+@pytest.mark.parametrize(
+    "s_q,h_q,ragged_stats",
+    [(1, 8, True), (1, 8, False), (1, 2, True), (2, 8, True)],
+    ids=["decode_gqa_ragged", "decode_gqa_padded_stats", "decode_mha_ragged", "prefill_gqa_ragged"],
+)
+def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, use_multiplier, s_q, h_q, ragged_stats):
+    """Single-token GQA must write every head's LSE, even when O is correct."""
+    from cudnn.engines.engine_ids import is_backend_engine
+
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("unified SDPA requires SM80 or newer")
+
+    b, h_kv, d = 3, 2, 128
+    kv_lengths = [128, 256, 128]
+    rng = torch.Generator(device="cuda").manual_seed(6783545)
+    q_gpu = torch.randn(b * s_q, h_q, d, device="cuda", dtype=dtype, generator=rng)
+    k_gpu = torch.randn(sum(kv_lengths), h_kv, d, device="cuda", dtype=dtype, generator=rng)
+    v_gpu = torch.randn(k_gpu.shape, device="cuda", dtype=dtype, generator=rng)
+    o_gpu = torch.full_like(q_gpu, float("nan"))
+    stats_gpu = torch.full((b, s_q, h_q, 1), float("nan"), device="cuda").transpose(1, 2)
+    cu_q_gpu = torch.arange(b + 1, dtype=torch.int32, device="cuda") * s_q
+    cu_kv_gpu = torch.tensor([0, 128, 384, 512], dtype=torch.int32, device="cuda")
+
+    graph = cudnn.pygraph(
+        io_data_type=cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        handle=cudnn_handle,
+    )
+    pack = {}
+
+    def offset(cu, token_stride):
+        data = cu.to(offset_dtype) * (1 if use_multiplier else token_stride)
+        desc = graph.tensor_like(data)
+        pack[desc] = data
+        return desc
+
+    def packed_tensor(data, heads, max_seq, cu):
+        desc = graph.tensor(dim=[b, heads, max_seq, d], stride=[max_seq * heads * d, d, heads * d, 1])
+        desc.set_ragged_offset(offset(cu, heads * d))
+        if use_multiplier:
+            desc.set_ragged_offset_multiplier(heads * d)
+        pack[desc] = data
+        return desc
+
+    q = packed_tensor(q_gpu, h_q, s_q, cu_q_gpu)
+    k = packed_tensor(k_gpu, h_kv, max(kv_lengths), cu_kv_gpu)
+    v = packed_tensor(v_gpu, h_kv, max(kv_lengths), cu_kv_gpu)
+    cu_q, cu_kv = graph.tensor_like(cu_q_gpu), graph.tensor_like(cu_kv_gpu)
+    pack.update({cu_q: cu_q_gpu, cu_kv: cu_kv_gpu})
+    o, stats = graph.sdpa(
+        q=q,
+        k=k,
+        v=v,
+        generate_stats=True,
+        attn_scale=d**-0.5,
+        use_padding_mask=True,
+        cu_seq_len_q=cu_q,
+        cu_seq_len_kv=cu_kv,
+        implementation=cudnn.attention_implementation.UNIFIED,
+    )
+    o.set_output(True).set_dim([b, h_q, s_q, d]).set_stride([s_q * h_q * d, d, h_q * d, 1])
+    o.set_ragged_offset(offset(cu_q_gpu, h_q * d))
+    if use_multiplier:
+        o.set_ragged_offset_multiplier(h_q * d)
+    stats.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride())
+    if ragged_stats:
+        stats.set_ragged_offset(offset(cu_q_gpu, h_q))
+        if use_multiplier:
+            stats.set_ragged_offset_multiplier(h_q)
+    pack.update({o: o_gpu, stats: stats_gpu})
+
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A])
+    # Pin a backend plan: a FROST pass cannot prove this native codegen regression.
+    backend_plans = [i for i in range(graph.get_execution_plan_count()) if is_backend_engine(graph.get_engine_and_knobs_at_index(i)[0])]
+    if not backend_plans:
+        pytest.skip("no unified backend plan on this device")
+    graph.select_plan(backend_plans[0])
+    graph.check_support()
+    graph.build_plans()
+    print("Ragged Stats backend plan:", graph.get_plan_name_at_index(backend_plans[0]))
+    workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    torch.cuda.synchronize()  # Inputs were created on the torch stream; the fixture handle owns another stream.
+    graph.execute(pack, workspace, handle=cudnn_handle)
+    torch.cuda.synchronize()
+
+    # Independent fp64 reference; check O as well as every q head's Stats.
+    kv_start = 0
+    stats_refs = []
+    for batch, kv_len in enumerate(kv_lengths):
+        q_ref = q_gpu[batch * s_q : (batch + 1) * s_q].double().transpose(0, 1)
+        k_ref = k_gpu[kv_start : kv_start + kv_len].double().transpose(0, 1).repeat_interleave(h_q // h_kv, dim=0)
+        v_ref = v_gpu[kv_start : kv_start + kv_len].double().transpose(0, 1).repeat_interleave(h_q // h_kv, dim=0)
+        scores = (q_ref @ k_ref.transpose(-1, -2)) * d**-0.5
+        o_ref = (scores.softmax(-1) @ v_ref).transpose(0, 1).to(dtype)
+        torch.testing.assert_close(o_gpu[batch * s_q : (batch + 1) * s_q], o_ref, atol=5e-3, rtol=1e-2)
+        stats_refs.append(scores.logsumexp(-1).float().unsqueeze(-1))
+        kv_start += kv_len
+
+    # Known issue on older backends (NVBug 6783545). Register only AFTER all O
+    # checks, so an unrelated plan/build/output failure is never an expected failure.
+    # Do not waive 9.28+ development builds: they must carry the backend fix.
+    # A backport to an older version is an XPASS that asks us to retire this marker.
+    if cudnn.backend_version() < 92800 and s_q == 1 and h_q > h_kv and ragged_stats:
+        request.node.add_marker(pytest.mark.xfail(strict=True, raises=AssertionError, reason="cuDNN < 9.28: ragged decode GQA Stats (NVBug 6783545)"))
+    torch.testing.assert_close(stats_gpu, torch.stack(stats_refs), atol=1e-4, rtol=1e-4)
+
+
+# fmt: off
+
 # # =====================================================
 # # L0 lean attention, s_kv=513..4096
 # # =====================================================
@@ -288,7 +410,8 @@ def test_sdpa_random_lean_attn_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
+        # ragged = packed-THD decode against a long KV (GitHub #980 coverage).
+        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 1, "full" : 1}),
         # sink_token not supported with s_q==1
         # dropout not supported with s_q==1
     ) as randomization_ctx:
@@ -366,40 +489,77 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.L0
-def test_ragged_token_gap_stable_under_stride_overrides():
-    """Regression: the seeded per-tensor token gaps must not depend on which
-    strides were explicitly provided — pinning stride_q must leave the gaps
-    K/V/O derive from the same rng_geom_seed unchanged (the gap RNG draws all
-    four values up front, not lazily per missing stride). Also locks in the
-    default-on semantics: gaps apply to plain ragged configs by default, and
-    auto-fall-back to packed for the forms that cannot express or handle
-    them yet (cu / offset-multiplier: #538; fp8 harness: #537)."""
+@pytest.mark.parametrize("side,seq_lens,minimum,default_capacity", [
+    ("q", [], 256, 320),
+    ("kv", [], 128, 192),
+    ("q", [0, 7], 7, 64),
+    ("kv", [0, 7], 7, 64),
+    ("q", [0, 0], 0, 64),
+    ("kv", [0, 0], 0, 64),
+])
+def test_ragged_capacity_uses_effective_seq_lens(side, seq_lens, minimum, default_capacity):
+    cfg = ExecConfig(
+        batches=2, h_q=8, h_k=8, h_v=8, s_q=128, s_kv=64, d_qk=128, d_v=128,
+        data_type=torch.float16, is_ragged=True, **{f"seq_len_{side}": seq_lens},
+    )
+    total = f"total_{side}"
+    cfg.fill_derived_fields()
+    assert getattr(cfg, total) == default_capacity
+
+    setattr(cfg, total, minimum)
+    cfg.fill_derived_fields()
+    assert getattr(cfg, total) == minimum
+
+    setattr(cfg, total, minimum - 1)
+    with pytest.raises(AssertionError, match=total):
+        cfg.fill_derived_fields()
+
+
+@pytest.mark.L0
+def test_ragged_stride_gaps_stable_under_stride_overrides():
+    """The seeded per-tensor token and head gaps must not depend on which strides
+    were explicitly provided, head gaps must respect the 16-byte rule, and turning
+    head gaps off must leave the token gaps of the same seed unchanged."""
     from sdpa.random_config import ExecConfig, compute_packed_strides
 
+    names = ("q", "k", "v", "o")
     base = dict(
         batches=2, h_q=8, h_k=8, h_v=8, s_q=64, s_kv=64, d_qk=128, d_v=128,
-        is_ragged=True, rng_geom_seed=7,
+        data_type=torch.float16, is_ragged=True, rng_geom_seed=7,
     )
     plain = ExecConfig(**base)
     plain.fill_derived_fields()
+    token_only = ExecConfig(**base, with_ragged_head_gap=False)
+    token_only.fill_derived_fields()
 
     pinned_q = (64 * 8 * 128, 128, 8 * 128, 1)  # explicit packed Q, no gap
     pinned = ExecConfig(**base, stride_q=pinned_q)
     pinned.fill_derived_fields()
-
     assert pinned.stride_q == pinned_q
     assert (pinned.stride_k, pinned.stride_v, pinned.stride_o) == (plain.stride_k, plain.stride_v, plain.stride_o)
 
-    # Default-on: seed 7 draws at least one non-packed layout for plain ragged.
-    packed = {n: compute_packed_strides(getattr(plain, f"shape_{n}")) for n in ("q", "k", "v", "o")}
-    assert any(getattr(plain, f"stride_{n}") != packed[n] for n in ("q", "k", "v", "o"))
+    quantum = 16 // plain.data_type.itemsize
+    head_gaps, token_gaps = [], []
+    for name in names:
+        _, h, _, d = getattr(plain, f"shape_{name}")
+        _, head_stride, token_stride, _ = getattr(plain, f"stride_{name}")
+        head_gap, token_gap = head_stride - d, token_stride - h * head_stride
+        assert head_gap >= 0 and head_gap % quantum == 0
+        assert token_gap >= 0 and token_gap % (h * d) == 0
+        # the head-gap knob must not disturb the token gap drawn for the same seed
+        _, off_head_stride, off_token_stride, _ = getattr(token_only, f"stride_{name}")
+        assert off_head_stride == d and off_token_stride - h * d == token_gap
+        head_gaps.append(head_gap)
+        token_gaps.append(token_gap)
+    assert any(head_gaps) and any(token_gaps)
 
     # Auto-packed fallbacks: cu / multiplier offset forms (#538) and 1-byte
     # (fp8) data types (#537) derive packed strides regardless of the default.
+    packed = {n: compute_packed_strides(getattr(plain, f"shape_{n}")) for n in names}
     for override in (dict(is_cu_seq_len=True), dict(with_ragged_offset_multiplier=True), dict(data_type=torch.float8_e4m3fn)):
-        cfg = ExecConfig(**base, **override)
+        cfg = ExecConfig(**{**base, **override})
         cfg.fill_derived_fields()
-        assert all(getattr(cfg, f"stride_{n}") == packed[n] for n in ("q", "k", "v", "o")), override
+        assert all(getattr(cfg, f"stride_{n}") == packed[n] for n in names), override
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
@@ -496,6 +656,7 @@ def test_sdpa_random_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
         is_deterministic=RandomChoice({True : 3, False : 1}),
         ragged_stats_layout=RandomChoice({"token_major" : 1, "head_major" : 1}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
+        with_stats_log2=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
@@ -694,7 +855,10 @@ def test_sdpa_fp8_fwd_L0(env_info, test_no, request, cudnn_handle):
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[4]),
         s_q_s_kv=RandomSequenceLength(s_q_min=1, s_q_max=8192, s_kv_min=1, s_kv_max=8192, s_q_distribution={"s_q=1": 2, "s_q=s_kv": 5, "s_q=random": 2}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=192, d_v_min=64, d_v_max=128, head_dim_distribution={"d_qk=d_v": 2, "d_qk=random": 1}, with_high_probability=[(64, 64), (128, 128), (192, 128)]),
+        # d up to 256: the fp8 forward sweep stopped at 192 while the backward
+        # sweep drew 256, which is how the d=256 fp8 forward defect (GitHub
+        # #981, FROST d256 fp8 TMEM race under masking) went unexercised here.
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=256, d_v_min=64, d_v_max=256, head_dim_distribution={"d_qk=d_v": 2, "d_qk=random": 1}, with_high_probability=[(64, 64), (128, 128), (192, 128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=16, head_group_options=(1, 5, 2)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
@@ -947,7 +1111,7 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=4),
         s_q_s_kv=RandomSequenceLength(s_q_min=128, s_q_max=8192, s_kv_min=128, s_kv_max=8192, s_q_distribution={"s_q=1": 0, "s_q=s_kv": 1, "s_q=random": 1}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=192, d_v_min=64, d_v_max=128, head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0}, with_high_probability=[(64, 64), (128, 128), (192, 128)]),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=256, d_v_min=64, d_v_max=256, head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0}, with_high_probability=[(64, 64), (128, 128), (192, 128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float8_e4m3fn: 3, torch.float8_e5m2: 1}),
         output_type=RandomChoice({torch.float16: 2, torch.bfloat16: 1}),  # FP16 more often for tighter tolerance testing
@@ -1108,6 +1272,61 @@ def test_sdpa_mixed_seq_len_forms_L0(env_info, cu_sides, diag_align, right_bound
     )
     test.cfg.fill_derived_fields()
     test.showConfig((request.node.name, len(MIXED_SEQ_LEN_FORM_CASES)), request)
+
+    exec_sdpa(test.cfg, request, cudnn_handle)
+
+
+@pytest.mark.L0
+def test_sdpa_thd_batch_stride_int32_overflow_L0(env_info, request, cudnn_handle):
+    """Packed-THD decode whose whole-buffer size exceeds INT32_MAX elements.
+
+    The FROST THD views bound the extent-1 batch dim with ``T * token_stride``;
+    the kernel ABI checks every stride against the int32 range, so a packed KV
+    buffer of more than 2^31 elements failed at execute with "Out of bound
+    k_tensor.strides[0]" (GitHub #980, found by the dsv3/kimi_k3 model suites:
+    h=128, d_qk=192, ~57k packed KV tokens). The random sweeps in this file
+    cannot reach that boundary within their memory budget (their largest packed
+    stride is 32 * 8192 * 32 * 192 = 1.6e9), so this pins it deterministically:
+    128 heads x d_qk=192 x 90,800 packed KV tokens = 2.23e9 > 2^31. K alone is
+    4.4 GiB -- that size is the bug's precondition, not a knob.
+    """
+    if torch.cuda.get_device_properties(0).total_memory < 16 * 2**30:
+        pytest.skip("needs a >4 GiB packed K buffer (plus V and reference)")
+    seq_len_kv = [11400] * 4 + [11300] * 4  # 90,800 tokens; each K token is 128*192 elements
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=980,
+        rng_geom_seed=980,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=False,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_cu_seq_len=False,
+        is_ragged=True,
+        with_ragged_token_gap=False,  # packed contract: token stride = h*d exactly
+        with_ragged_head_gap=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=len(seq_len_kv),
+        d_qk=192,
+        d_v=64,  # keeps V at ~1.5 GiB; only K needs to cross the boundary
+        s_q=1,
+        s_kv=max(seq_len_kv),
+        h_q=128,
+        h_k=128,
+        h_v=128,
+        diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+        left_bound=None,
+        right_bound=None,
+        seq_len_q=[1] * len(seq_len_kv),
+        seq_len_kv=seq_len_kv,
+    )
+    test.cfg.fill_derived_fields()
+    assert sum(seq_len_kv) * test.cfg.h_k * test.cfg.d_qk > 2**31, "config must cross the int32 element boundary"
+    test.showConfig((request.node.name, 1), request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)
 

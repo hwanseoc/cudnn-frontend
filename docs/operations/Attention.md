@@ -140,37 +140,37 @@ The support matrix is based on the latest cudnn backend version 9.18.1
 To run the sdpa benchmarks, refer to [benchmarks/sdpa](https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/attention_training/README.md) folder. Current results:
 
 ### GB200 - Llama 3.1 Causal (top_left)
-![Llama 3.1 Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/llama3.1/gb200/llama3.1_top_left.png) 
+![Llama 3.1 Causal on GB200](../../benchmark/attention_training/results/llama3.1/gb200/llama3.1_top_left.webp)
 - SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB200 GPU
 
 ### GB200 - Llama 3.1 Non-Causal (no_mask)
-![Llama 3.1 Non-Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/llama3.1/gb200/llama3.1_no_mask.png)
+![Llama 3.1 Non-Causal on GB200](../../benchmark/attention_training/results/llama3.1/gb200/llama3.1_no_mask.webp)
 - SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=False`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB200 GPU
 
 ### GB200 - DeepSeek V3 Causal (top_left)
-![DeepSeek V3 Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/dsv3/gb200/dsv3_top_left.png)
+![DeepSeek V3 Causal on GB200](../../benchmark/attention_training/results/dsv3/gb200/dsv3_top_left.webp)
 - SDPA parameters: `batch=1; num_q_heads=128; num_kv_heads=128; head_dim_qk=192; head_dim_vo=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB200 GPU
 
 ### GB300 - Llama 3.1 Causal (top_left)
-![Llama 3.1 Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/llama3.1/gb300/llama3.1_top_left.png)
+![Llama 3.1 Causal on GB300](../../benchmark/attention_training/results/llama3.1/gb300/llama3.1_top_left.webp)
 - SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB300 GPU
 
 ### GB300 - Llama 3.1 Non-Causal (no_mask)
-![Llama 3.1 Non-Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/llama3.1/gb300/llama3.1_no_mask.png)
+![Llama 3.1 Non-Causal on GB300](../../benchmark/attention_training/results/llama3.1/gb300/llama3.1_no_mask.webp)
 - SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=False`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB300 GPU
 
 ### GB300 - DeepSeek V3 Causal (top_left)
-![DeepSeek V3 Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/dsv3/gb300/dsv3_top_left.png)
+![DeepSeek V3 Causal on GB300](../../benchmark/attention_training/results/dsv3/gb300/dsv3_top_left.webp)
 - SDPA parameters: `batch=1; num_q_heads=128; num_kv_heads=128; head_dim_qk=192; head_dim_vo=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB300 GPU
@@ -195,6 +195,11 @@ The `options` parameter of type `SDPA_attributes` is used to control the attribu
 // Indicates that softmax_stats should be generated (useful during training).
 // If false, the softmax_stats output will be nullptr.
 SDPA_attributes& set_generate_stats(bool const value);
+
+// Return softmax_stats in base 2, i.e. (max + ln(sum_exp)) * log2(e), instead of the
+// default natural-log form max + ln(sum_exp). Matches flash-attention-style
+// kernels that fold log2(e) into the softmax scale. Only affects softmax_stats.
+SDPA_attributes& set_stats_use_log2(bool const value);
 
 // Indicates whether the kernel should output max of attention score
 // and numerically stable sum of exponents using normalized values wrt max score
@@ -308,6 +313,7 @@ graph.sdpa(
     max_total_seq_len_q=None,             # Packed token total for Q (ragged tensors)
     max_total_seq_len_kv=None,            # Packed token total for KV (ragged tensors)
     generate_stats=None,                  # Output softmax stats for training (True/False)
+    stats_use_log2=False,                 # Return stats as (max + ln(sum_exp)) * log2(e) instead of max + ln(sum_exp)
     implementation=AUTO,                  # SDPA implementation: AUTO, COMPOSITE, UNIFIED
     unfuse_fma=False,                     # Use unfused mul/add in the softmax computation
     compute_data_type=NOT_SET,            # Computation data type
@@ -337,6 +343,7 @@ graph.sdpa(
 - `paged_attention_v_table` (Optional[cudnn_tensor]): Page table with block offsets into the V container.
 - `paged_attention_max_seq_len_kv` (Optional[int]): Maximum sequence length for K/V caches. Recommended when using paged attention.
 - `generate_stats` (Optional[bool]): If True, output softmax statistics for backward pass. Required for training.
+- `stats_use_log2` (Optional[bool]): If True, `stats` is returned in base 2, $\log_2(e)\,[\max + \ln(\sum e^{s - \max})]$, instead of the default natural-log form $\max + \ln(\sum e^{s - \max})$. This is the convention of flash-attention-style kernels (FA2/FA3, TRT-LLM) that fold $\log_2 e$ into the softmax scale, so consumers that mix LSE tensors from several backends (cascade/split-KV merges, speculative decoding) get one convention without an extra elementwise pass. Only affects `stats`; `score_max` and `score_sum_exp` are unchanged, and `sdpa_backward` still expects natural-log stats. Served by the FROST SDPA engines and by the `UNIFIED` implementation on cuDNN 9.28.0+ (`CUDNN_ATTR_OPERATION_SDPA_FWD_STATS_LOG2`); the `COMPOSITE` implementation declines it at validation.
 - `implementation` (Optional[cudnn.attention_implementation]): SDPA implementation to use. `AUTO` (default), `COMPOSITE`, or `UNIFIED`.
 - `unfuse_fma` (Optional[bool]): Use unfused mul/add in the softmax computation.
 - `compute_data_type` (Optional[cudnn.data_type]): Data type for internal computation.
@@ -344,7 +351,7 @@ graph.sdpa(
 
 **Returns:**
 - `o` (cudnn_tensor): The output attention data with shape $(B, H_q, S_q, D_v)$.
-- `stats` (Optional[cudnn_tensor]): Softmax statistics with shape $(B, H_q, S_q, 1)$ when `generate_stats=True`.
+- `stats` (Optional[cudnn_tensor]): Softmax statistics with shape $(B, H_q, S_q, 1)$ when `generate_stats=True`. Natural log by default ($\max + \ln \sum e^{s - \max}$); base 2 when `stats_use_log2=True`.
 
 #### Configurable Options
 
@@ -393,6 +400,8 @@ graph.sdpa(
 - **Unfuse FMA** (`unfuse_fma`): Uses unfused mul/add in the softmax computation.
 
 - **Generate stats** (`generate_stats`): When `True`, outputs softmax statistics needed for backward pass during training. Set to `True` for training, `False` for inference.
+
+- **Stats in base 2** (`stats_use_log2`): Returns `stats` as $\log_2(e)\,[\max + \ln(\sum e^{s - \max})]$ rather than the natural-log default. The value is exactly the natural-log stats times $\log_2 e$, so it is a convention switch, not a different quantity; the backward pass is unaffected and continues to take natural-log stats.
 
 #### Limitations
 
