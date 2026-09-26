@@ -1034,9 +1034,9 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 a_tensor,
                 b_tensor,
                 sfb_tensor,
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int64(0),
+                0,
+                0,
+                0,
                 cached_workspace_ptr,
                 c_tensor,
                 d_tensor,
@@ -1051,18 +1051,18 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 prob_tensor,
                 bias_tensor,
                 stream,
-                cutlass.Float32(linear_offset),
+                linear_offset,
             )
             if self._is_rubin_kernel:
                 _compiled_kernel(*kernel_args, scheduler_counter_tensor)
             else:
                 _compiled_kernel(
                     *kernel_args,
-                    cutlass.Float32(geglu_alpha),
-                    cutlass.Float32(glu_clamp_max),
-                    cutlass.Float32(glu_clamp_min),
-                    cutlass.Float32(situ_beta1),
-                    cutlass.Float32(situ_beta2),
+                    geglu_alpha,
+                    glu_clamp_max,
+                    glu_clamp_min,
+                    situ_beta1,
+                    situ_beta2,
                     scheduler_counter_tensor,
                 )
 
@@ -1275,18 +1275,18 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 prob_tensor,
                 bias_tensor,
                 stream,
-                cutlass.Float32(linear_offset),
+                linear_offset,
             )
             if self._is_rubin_kernel:
                 _compiled_kernel(*kernel_args)
             else:
                 _compiled_kernel(
                     *kernel_args,
-                    cutlass.Float32(geglu_alpha),
-                    cutlass.Float32(glu_clamp_max),
-                    cutlass.Float32(glu_clamp_min),
-                    cutlass.Float32(situ_beta1),
-                    cutlass.Float32(situ_beta2),
+                    geglu_alpha,
+                    glu_clamp_max,
+                    glu_clamp_min,
+                    situ_beta1,
+                    situ_beta2,
                 )
 
         self._compiled_kernel = tensor_api
