@@ -74,6 +74,7 @@ nanobind_add_module(
     NOMINSIZE
 
     pycudnn.cpp
+    ops_binding.cpp
     gnn.cpp
     properties.cpp
 

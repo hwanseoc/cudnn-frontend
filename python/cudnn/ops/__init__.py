@@ -24,6 +24,14 @@ _LAZY_EXPORTS = {
     "Nvfp4BlockScaleDequantizer": (".nvfp4", "Nvfp4BlockScaleDequantizer"),
     "nvfp4_block_scale_quantize": (".nvfp4", "nvfp4_block_scale_quantize"),
     "nvfp4_block_scale_dequantize": (".nvfp4", "nvfp4_block_scale_dequantize"),
+    "sdpa_forward": (".sdpa_forward", "sdpa_forward"),
+    "sdpa_forward_config": (".sdpa_forward", "sdpa_forward_config"),
+    "kda_forward": (".kda_forward", "kda_forward"),
+    "kda_forward_config": (".kda_forward", "kda_forward_config"),
+    "compile": ("._library", "compile"),
+    "register": ("._library", "register"),
+    "KernelLibrary": ("._library", "KernelLibrary"),
+    "Target": ("._library", "Target"),
 }
 
 __all__ = list(_LAZY_EXPORTS)
