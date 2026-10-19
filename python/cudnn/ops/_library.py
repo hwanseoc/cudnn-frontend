@@ -44,6 +44,8 @@ FORMAT = 1
 _BUILDERS = {
     "kda_forward": "cudnn.ops.kda_forward:_build",
     "sdpa_forward": "cudnn.ops.sdpa_forward:_build",
+    "sdpa_backward": "cudnn.ops.sdpa_backward:_build",
+    "kda_backward": "cudnn.ops.kda_backward:_build",
 }
 
 _LOCK = threading.Lock()

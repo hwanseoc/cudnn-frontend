@@ -48,7 +48,11 @@ struct KdaForwardTensors {
     TensorView const *dt_bias       = nullptr;  // [HO, K], safe_gate only
 };
 
+class KdaBackward;
+
 class KdaForward {
+    friend class KdaBackward;  // shares the input checks
+
    public:
     // Validates, lays out the workspace and takes the kernel from lib. Never
     // compiles: a kernel missing from lib is an error naming its configuration.

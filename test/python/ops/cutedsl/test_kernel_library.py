@@ -14,18 +14,21 @@ from ops_test_utils import build_sample, requires_ops, run
 pytestmark = [pytest.mark.L0, requires_ops]
 
 
+SAMPLES = ("sdpa_forward", "sdpa_backward", "kda_forward", "kda_backward")
+
+
 @pytest.fixture(scope="module")
 def samples(tmp_path_factory):
     out = tmp_path_factory.mktemp("ops_samples")
-    exes = {name: build_sample(name, str(out)) for name in ("sdpa_forward", "kda_forward")}
-    configs = [run([exe, "--config"], check=True).stdout.strip() for exe in exes.values()]
-    (out / "configs.txt").write_text("\n".join(configs) + "\n")
+    exes = {name: build_sample(name, str(out)) for name in SAMPLES}
+    configs = {name: run([exe, "--config"], check=True).stdout.split() for name, exe in exes.items()}
+    (out / "configs.txt").write_text("\n".join(c for cs in configs.values() for c in cs) + "\n")
     proc = run([sys.executable, "-m", "cudnn.ops", str(out / "configs.txt"), "-o", str(out / "kernels.cudnn")])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     return out, exes, configs
 
 
-@pytest.mark.parametrize("name", ["sdpa_forward", "kda_forward"])
+@pytest.mark.parametrize("name", SAMPLES)
 def test_cpp_sample_runs_from_a_library_file(samples, name):
     out, exes, _ = samples
     proc = run([exes[name], str(out / "kernels.cudnn")])
@@ -37,7 +40,7 @@ def test_python_config_is_the_cpp_config(samples):
     from cudnn.ops import _library
 
     _, _, configs = samples
-    for config in configs:
+    for config in (c for cs in configs.values() for c in cs):
         assert _library.canonical(config) == config
 
 
@@ -45,10 +48,10 @@ def test_missing_kernel_names_its_configuration(samples, tmp_path):
     from cudnn.ops import _library
 
     _, exes, configs = samples
-    _library.compile([configs[1]]).save(tmp_path / "kda_only.cudnn")  # no SDPA kernel in it
+    _library.compile(configs["kda_forward"]).save(tmp_path / "kda_only.cudnn")  # no SDPA kernel in it
     proc = run([exes["sdpa_forward"], str(tmp_path / "kda_only.cudnn")])
     assert proc.returncode != 0
-    assert configs[0] in proc.stderr and "cudnn.ops.compile" in proc.stderr
+    assert configs["sdpa_forward"][0] in proc.stderr and "cudnn.ops.compile" in proc.stderr
 
 
 def test_library_for_another_gpu_is_refused(samples, tmp_path):

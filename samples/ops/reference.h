@@ -177,4 +177,132 @@ kda(std::vector<float> const &q,
     return o;
 }
 
+// Gradients of sdpa() with as many KV heads as query heads: {dq, dk, dv}, each [T, H, D].
+inline std::vector<std::vector<double>>
+sdpa_backward(std::vector<float> const &q,
+              std::vector<float> const &k,
+              std::vector<float> const &v,
+              std::vector<float> const &d_o,
+              std::vector<int> const &cu,
+              int heads,
+              int d,
+              bool causal) {
+    std::vector<std::vector<double>> grads(3, std::vector<double>(q.size(), 0.0));
+    auto &dq = grads[0], &dk = grads[1], &dv = grads[2];
+    double const scale = 1.0 / std::sqrt(static_cast<double>(d));
+    auto at            = [&](int token, int h) { return (static_cast<size_t>(token) * heads + h) * d; };
+    for (size_t s = 0; s + 1 < cu.size(); s++) {
+        int const first = cu[s], n = cu[s + 1] - cu[s];
+        for (int h = 0; h < heads; h++) {
+            for (int i = 0; i < n; i++) {
+                int const keys = causal ? i + 1 : n;
+                std::vector<double> p(keys), dp(keys);
+                double max = -INFINITY, sum = 0, delta = 0;
+                for (int j = 0; j < keys; j++) {
+                    double dot = 0;
+                    for (int x = 0; x < d; x++) dot += q[at(first + i, h) + x] * k[at(first + j, h) + x];
+                    max = std::max(max, p[j] = dot * scale);
+                }
+                for (auto &x : p) sum += (x = std::exp(x - max));
+                for (int j = 0; j < keys; j++) {
+                    p[j] /= sum;
+                    for (int x = 0; x < d; x++) dp[j] += d_o[at(first + i, h) + x] * v[at(first + j, h) + x];
+                    delta += p[j] * dp[j];  // rowsum(dO * O)
+                }
+                for (int j = 0; j < keys; j++) {
+                    double const ds = p[j] * (dp[j] - delta) * scale;
+                    for (int x = 0; x < d; x++) {
+                        dv[at(first + j, h) + x] += p[j] * d_o[at(first + i, h) + x];
+                        dq[at(first + i, h) + x] += ds * k[at(first + j, h) + x];
+                        dk[at(first + j, h) + x] += ds * q[at(first + i, h) + x];
+                    }
+                }
+            }
+        }
+    }
+    return grads;
+}
+
+// Gradients of the KDA recurrence (no l2 normalization, log-domain gate, state V-major [V, K]) by backpropagation
+// through time: {dq, dk, dv, dg, dbeta, d_initial_state}.
+inline std::vector<std::vector<double>>
+kda_backward(std::vector<float> const &q,
+             std::vector<float> const &k,
+             std::vector<float> const &v,
+             std::vector<float> const &g,
+             std::vector<float> const &beta,
+             std::vector<float> const &state0,
+             std::vector<float> const &d_o,
+             std::vector<int> const &cu,
+             int heads,
+             int d) {
+    std::vector<std::vector<double>> grads = {std::vector<double>(q.size()),
+                                              std::vector<double>(q.size()),
+                                              std::vector<double>(q.size()),
+                                              std::vector<double>(q.size()),
+                                              std::vector<double>(beta.size()),
+                                              std::vector<double>(state0.size())};
+    auto &dq = grads[0], &dk = grads[1], &dv = grads[2], &dg = grads[3], &dbeta = grads[4], &ds0 = grads[5];
+    double const scale = 1.0 / std::sqrt(static_cast<double>(d));
+    size_t const dd    = static_cast<size_t>(d) * d;
+    for (size_t s = 0; s + 1 < cu.size(); s++) {
+        for (int h = 0; h < heads; h++) {
+            int const n = cu[s + 1] - cu[s];
+            std::vector<std::vector<double>> states(n + 1);  // states[t] is the state before token t
+            states[0].assign(state0.begin() + (s * heads + h) * dd, state0.begin() + (s * heads + h + 1) * dd);
+            auto row  = [&](int t) { return (static_cast<size_t>(cu[s] + t) * heads + h) * d; };
+            auto step = [&](int t, std::vector<double> &a, std::vector<double> &r) {  // decayed state, residual
+                size_t const x = row(t);
+                a              = states[t];
+                r.assign(d, 0.0);
+                for (int vi = 0; vi < d; vi++) {
+                    double u = 0;
+                    for (int ki = 0; ki < d; ki++) u += (a[vi * d + ki] *= std::exp(g[x + ki])) * k[x + ki];
+                    r[vi] = v[x + vi] - u;
+                }
+            };
+            std::vector<double> a, r;
+            for (int t = 0; t < n; t++) {
+                step(t, a, r);
+                double const b = beta[(cu[s] + t) * heads + h];
+                for (int vi = 0; vi < d; vi++)
+                    for (int ki = 0; ki < d; ki++) a[vi * d + ki] += b * r[vi] * k[row(t) + ki];
+                states[t + 1] = a;
+            }
+            std::vector<double> ds(dd, 0.0), dr(d);
+            for (int t = n - 1; t >= 0; t--) {
+                size_t const x   = row(t);
+                size_t const bt  = static_cast<size_t>(cu[s] + t) * heads + h;
+                auto const &next = states[t + 1];
+                for (int vi = 0; vi < d; vi++) {  // o = scale * S q
+                    for (int ki = 0; ki < d; ki++) {
+                        ds[vi * d + ki] += scale * d_o[x + vi] * q[x + ki];
+                        dq[x + ki] += scale * next[vi * d + ki] * d_o[x + vi];
+                    }
+                }
+                step(t, a, r);
+                for (int vi = 0; vi < d; vi++) {  // S = A + beta r k^T
+                    double dsk = 0;
+                    for (int ki = 0; ki < d; ki++) dsk += ds[vi * d + ki] * k[x + ki];
+                    dbeta[bt] += dsk * r[vi];
+                    dr[vi]     = beta[bt] * dsk;
+                    dv[x + vi] = dr[vi];  // r = v - A k
+                }
+                for (int ki = 0; ki < d; ki++) {
+                    double alpha = std::exp(g[x + ki]), dalpha = 0;
+                    for (int vi = 0; vi < d; vi++) {
+                        double const da = ds[vi * d + ki] - dr[vi] * k[x + ki];
+                        dk[x + ki] += beta[bt] * ds[vi * d + ki] * r[vi] - a[vi * d + ki] * dr[vi];
+                        dalpha += da * states[t][vi * d + ki];
+                        ds[vi * d + ki] = da * alpha;  // A = S diag(alpha)
+                    }
+                    dg[x + ki] = dalpha * alpha;
+                }
+            }
+            std::copy(ds.begin(), ds.end(), ds0.begin() + (s * heads + h) * dd);
+        }
+    }
+    return grads;
+}
+
 }  // namespace reference

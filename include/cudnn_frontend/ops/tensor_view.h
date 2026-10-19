@@ -35,8 +35,9 @@ struct TensorView {
 // repeat the last offset (empty sequences).
 struct SeqLayout {
     TensorView offsets;  // device, [max_seqs + 1], INT32
-    int64_t max_seqs   = 0;
-    int64_t max_tokens = 0;
+    int64_t max_seqs    = 0;
+    int64_t max_tokens  = 0;
+    int64_t max_seq_len = 0;  // bound on any one sequence's length; 0 means max_tokens
 };
 
 // Packed values [max_tokens, ...] and the layout they follow.

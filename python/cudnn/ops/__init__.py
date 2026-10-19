@@ -28,6 +28,8 @@ _LAZY_EXPORTS = {
     "sdpa_forward_config": (".sdpa_forward", "sdpa_forward_config"),
     "kda_forward": (".kda_forward", "kda_forward"),
     "kda_forward_config": (".kda_forward", "kda_forward_config"),
+    "sdpa_backward": (".sdpa_backward", "sdpa_backward"),
+    "kda_backward": (".kda_backward", "kda_backward"),
     "compile": ("._library", "compile"),
     "register": ("._library", "register"),
     "KernelLibrary": ("._library", "KernelLibrary"),

@@ -43,3 +43,10 @@ def kda(q, k, v, g, beta, cu, initial_state):
             state = state + beta[t][:, None, None] * residual[:, :, None] * k[t][:, None, :]
             o[t] = (state @ q[t][:, :, None])[..., 0]
     return o
+
+
+def gradients(fn, inputs, d_out):
+    """fp64 gradients of ``fn(*inputs)`` with respect to every input, given the output gradient."""
+    leaves = [x.double().detach().requires_grad_() for x in inputs]
+    fn(*leaves).backward(d_out.double())
+    return [x.grad for x in leaves]

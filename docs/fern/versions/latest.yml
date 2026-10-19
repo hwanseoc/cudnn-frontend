@@ -123,7 +123,7 @@ navigation:
           - page: Causal Conv1d Decode Update
             path: ../../fe-oss-apis/causal_conv1d_update.md
             slug: causal_conv1d_update
-          - page: Ops from C++ (SDPA and KDA forward)
+          - page: Ops from C++ (SDPA and KDA)
             path: ../../fe-oss-apis/ops_cpp.md
             slug: ops_cpp
           - page: CSA Fused Compressor

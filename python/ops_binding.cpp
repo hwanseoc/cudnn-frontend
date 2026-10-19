@@ -14,7 +14,9 @@
 #include <nanobind/stl/string.h>
 
 #include "cudnn_frontend.h"
+#include "cudnn_frontend/ops/kda_backward.h"
 #include "cudnn_frontend/ops/kda_forward.h"
+#include "cudnn_frontend/ops/sdpa_backward.h"
 #include "cudnn_frontend/ops/sdpa_forward.h"
 
 namespace py = nanobind;
@@ -143,6 +145,72 @@ sdpa_options(py::dict const &d) {
     return o;
 }
 
+struct SdpaBwdCall {
+    SeqLayout q_layout, kv_layout;
+    SdpaBackwardTensors t;
+
+    SdpaBwdCall(py::dict const &d, py::dict const &options) {
+        q_layout.offsets   = view(d["cu_seqlens_q"]);
+        kv_layout.offsets  = view(d["cu_seqlens_kv"]);
+        TensorView const q = view(d["q"]), k = view(d["k"]);
+        q_layout.max_seqs     = q_layout.offsets.dim[0] - 1;
+        kv_layout.max_seqs    = kv_layout.offsets.dim[0] - 1;
+        q_layout.max_tokens   = q.dim[0];
+        kv_layout.max_tokens  = k.dim[0];
+        q_layout.max_seq_len  = option(options, "max_seqlen_q", int64_t{0});
+        kv_layout.max_seq_len = option(options, "max_seqlen_kv", int64_t{0});
+        t.q                   = {q, &q_layout};
+        t.k                   = {k, &kv_layout};
+        t.v                   = {view(d["v"]), &kv_layout};
+        t.o                   = {view(d["o"]), &q_layout};
+        t.d_o                 = {view(d["do"]), &q_layout};
+        t.stats               = view(d["stats"]);
+        t.dq                  = {view(d["dq"]), &q_layout};
+        t.dk                  = {view(d["dk"]), &kv_layout};
+        t.dv                  = {view(d["dv"]), &kv_layout};
+    }
+    SdpaBwdCall(SdpaBwdCall const &) = delete;
+};
+
+SdpaBackwardOptions
+sdpa_bwd_options(py::dict const &d) {
+    SdpaBackwardOptions o;
+    o.scale  = optional_float(d, "scale");
+    o.causal = option(d, "causal", false);
+    return o;
+}
+
+struct KdaBwdCall {
+    SeqLayout layout;
+    std::optional<TensorView> s0, ds1, ds0;
+    KdaBackwardTensors t;
+
+    KdaBwdCall(py::dict const &d, py::dict const &) {
+        layout.offsets     = view(d["cu_seqlens"]);
+        layout.max_seqs    = layout.offsets.dim[0] - 1;
+        TensorView const q = view(d["q"]);
+        layout.max_tokens  = q.dim[0];
+        t.q                = {q, &layout};
+        t.k                = {view(d["k"]), &layout};
+        t.v                = {view(d["v"]), &layout};
+        t.g                = {view(d["g"]), &layout};
+        t.beta             = {view(d["beta"]), &layout};
+        t.d_o              = {view(d["do"]), &layout};
+        t.dq               = {view(d["dq"]), &layout};
+        t.dk               = {view(d["dk"]), &layout};
+        t.dv               = {view(d["dv"]), &layout};
+        t.dg               = {view(d["dg"]), &layout};
+        t.dbeta            = {view(d["dbeta"]), &layout};
+        s0                 = optional_view(d, "initial_state");
+        ds1                = optional_view(d, "d_final_state");
+        ds0                = optional_view(d, "d_initial_state");
+        t.initial_state    = s0 ? &*s0 : nullptr;
+        t.d_final_state    = ds1 ? &*ds1 : nullptr;
+        t.d_initial_state  = ds0 ? &*ds0 : nullptr;
+    }
+    KdaBwdCall(KdaBwdCall const &) = delete;
+};
+
 // A plan and the views it was created with. execute_pointers() rebinds only the
 // addresses, so a warm Python call converts no shapes; it runs under the GIL,
 // which serializes the rebinding.
@@ -151,8 +219,10 @@ struct Prepared {
     std::unique_ptr<Call> call;
     Plan plan;
 };
-using KdaPrepared  = Prepared<KdaForward, KdaCall>;
-using SdpaPrepared = Prepared<SdpaForward, SdpaCall>;
+using KdaPrepared     = Prepared<KdaForward, KdaCall>;
+using SdpaPrepared    = Prepared<SdpaForward, SdpaCall>;
+using SdpaBwdPrepared = Prepared<SdpaBackward, SdpaBwdCall>;
+using KdaBwdPrepared  = Prepared<KdaBackward, KdaBwdCall>;
 
 void *
 ptr(intptr_t p) {
@@ -252,6 +322,103 @@ init_ops_submodule(py::module_ &m) {
         SdpaCall call(tensors);
         std::string config;
         check(SdpaForward::kernel_config(call.t, sdpa_options(options), config));
+        return config;
+    });
+    py::class_<SdpaBwdPrepared>(m, "_SdpaBackward")
+        .def("__init__",
+             [](SdpaBwdPrepared *self, py::dict tensors, py::dict options) {
+                 auto call = std::make_unique<SdpaBwdCall>(tensors, options);
+                 SdpaBackward plan;
+                 check(SdpaBackward::create(call->t, sdpa_bwd_options(options), KernelLibrary::registry(), plan));
+                 new (self) SdpaBwdPrepared{std::move(call), std::move(plan)};
+             })
+        .def_prop_ro("workspace_size", [](SdpaBwdPrepared const &self) { return self.plan.workspace_size(); })
+        .def("execute_pointers",
+             [](SdpaBwdPrepared &self,
+                intptr_t q,
+                intptr_t k,
+                intptr_t v,
+                intptr_t o,
+                intptr_t d_o,
+                intptr_t stats,
+                intptr_t dq,
+                intptr_t dk,
+                intptr_t dv,
+                intptr_t cu_seqlens_q,
+                intptr_t cu_seqlens_kv,
+                intptr_t workspace,
+                intptr_t stream) {
+                 auto &c                  = *self.call;
+                 c.t.q.values.data        = ptr(q);
+                 c.t.k.values.data        = ptr(k);
+                 c.t.v.values.data        = ptr(v);
+                 c.t.o.values.data        = ptr(o);
+                 c.t.d_o.values.data      = ptr(d_o);
+                 c.t.stats.data           = ptr(stats);
+                 c.t.dq.values.data       = ptr(dq);
+                 c.t.dk.values.data       = ptr(dk);
+                 c.t.dv.values.data       = ptr(dv);
+                 c.q_layout.offsets.data  = ptr(cu_seqlens_q);
+                 c.kv_layout.offsets.data = ptr(cu_seqlens_kv);
+                 check(self.plan.execute(c.t, ptr(workspace), reinterpret_cast<cudaStream_t>(stream)));
+             });
+    m.def("_sdpa_backward_config", [](py::dict tensors, py::dict options) {
+        SdpaBwdCall call(tensors, options);
+        std::string config;
+        check(SdpaBackward::kernel_config(call.t, sdpa_bwd_options(options), config));
+        return config;
+    });
+
+    py::class_<KdaBwdPrepared>(m, "_KdaBackward")
+        .def("__init__",
+             [](KdaBwdPrepared *self, py::dict tensors, py::dict options) {
+                 auto call = std::make_unique<KdaBwdCall>(tensors, options);
+                 KdaBackward plan;
+                 check(KdaBackward::create(call->t, kda_options(options), KernelLibrary::registry(), plan));
+                 new (self) KdaBwdPrepared{std::move(call), std::move(plan)};
+             })
+        .def_prop_ro("workspace_size", [](KdaBwdPrepared const &self) { return self.plan.workspace_size(); })
+        .def("execute_pointers",
+             [](KdaBwdPrepared &self,
+                intptr_t q,
+                intptr_t k,
+                intptr_t v,
+                intptr_t g,
+                intptr_t beta,
+                intptr_t d_o,
+                intptr_t dq,
+                intptr_t dk,
+                intptr_t dv,
+                intptr_t dg,
+                intptr_t dbeta,
+                intptr_t cu_seqlens,
+                intptr_t initial_state,
+                intptr_t d_final_state,
+                intptr_t d_initial_state,
+                intptr_t workspace,
+                intptr_t stream) {
+                 auto &c               = *self.call;
+                 c.t.q.values.data     = ptr(q);
+                 c.t.k.values.data     = ptr(k);
+                 c.t.v.values.data     = ptr(v);
+                 c.t.g.values.data     = ptr(g);
+                 c.t.beta.values.data  = ptr(beta);
+                 c.t.d_o.values.data   = ptr(d_o);
+                 c.t.dq.values.data    = ptr(dq);
+                 c.t.dk.values.data    = ptr(dk);
+                 c.t.dv.values.data    = ptr(dv);
+                 c.t.dg.values.data    = ptr(dg);
+                 c.t.dbeta.values.data = ptr(dbeta);
+                 c.layout.offsets.data = ptr(cu_seqlens);
+                 if (c.s0) c.s0->data = ptr(initial_state);
+                 if (c.ds1) c.ds1->data = ptr(d_final_state);
+                 if (c.ds0) c.ds0->data = ptr(d_initial_state);
+                 check(self.plan.execute(c.t, ptr(workspace), reinterpret_cast<cudaStream_t>(stream)));
+             });
+    m.def("_kda_backward_config", [](py::dict tensors, py::dict options) {
+        KdaBwdCall call(tensors, options);
+        std::string config;
+        check(KdaBackward::kernel_config(call.t, kda_options(options), config));
         return config;
     });
 }
