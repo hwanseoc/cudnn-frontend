@@ -6,6 +6,7 @@
 // do, with kernels from the in-process registry (cudnn.ops.register).
 // Tensors arrive as (address, cudnn.data_type, shape, strides) tuples.
 
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -142,23 +143,69 @@ sdpa_options(py::dict const &d) {
     return o;
 }
 
+// A plan and the views it was created with. execute_pointers() rebinds only the
+// addresses, so a warm Python call converts no shapes; it runs under the GIL,
+// which serializes the rebinding.
+template <typename Plan, typename Call>
+struct Prepared {
+    std::unique_ptr<Call> call;
+    Plan plan;
+};
+using KdaPrepared  = Prepared<KdaForward, KdaCall>;
+using SdpaPrepared = Prepared<SdpaForward, SdpaCall>;
+
+void *
+ptr(intptr_t p) {
+    return reinterpret_cast<void *>(p);
+}
+
 }  // namespace
 
 void
 init_ops_submodule(py::module_ &m) {
-    py::class_<KdaForward>(m, "_KdaForward")
+    py::class_<KdaPrepared>(m, "_KdaForward")
         .def("__init__",
-             [](KdaForward *self, py::dict tensors, py::dict options) {
-                 KdaCall call(tensors);
+             [](KdaPrepared *self, py::dict tensors, py::dict options) {
+                 auto call = std::make_unique<KdaCall>(tensors);
                  KdaForward plan;
-                 check(KdaForward::create(call.t, kda_options(options), KernelLibrary::registry(), plan));
-                 new (self) KdaForward(std::move(plan));
+                 check(KdaForward::create(call->t, kda_options(options), KernelLibrary::registry(), plan));
+                 new (self) KdaPrepared{std::move(call), std::move(plan)};
              })
-        .def_prop_ro("workspace_size", &KdaForward::workspace_size)
-        .def("execute", [](KdaForward const &self, py::dict tensors, intptr_t workspace, intptr_t stream) {
-            KdaCall call(tensors);
-            check(self.execute(call.t, reinterpret_cast<void *>(workspace), reinterpret_cast<cudaStream_t>(stream)));
-        });
+        .def_prop_ro("workspace_size", [](KdaPrepared const &self) { return self.plan.workspace_size(); })
+        .def("execute",
+             [](KdaPrepared const &self, py::dict tensors, intptr_t workspace, intptr_t stream) {
+                 KdaCall call(tensors);
+                 check(self.plan.execute(call.t, ptr(workspace), reinterpret_cast<cudaStream_t>(stream)));
+             })
+        .def("execute_pointers",
+             [](KdaPrepared &self,
+                intptr_t q,
+                intptr_t k,
+                intptr_t v,
+                intptr_t g,
+                intptr_t beta,
+                intptr_t o,
+                intptr_t cu_seqlens,
+                intptr_t initial_state,
+                intptr_t final_state,
+                intptr_t a_log,
+                intptr_t dt_bias,
+                intptr_t workspace,
+                intptr_t stream) {
+                 auto &c               = *self.call;
+                 c.t.q.values.data     = ptr(q);
+                 c.t.k.values.data     = ptr(k);
+                 c.t.v.values.data     = ptr(v);
+                 c.t.g.values.data     = ptr(g);
+                 c.t.beta.values.data  = ptr(beta);
+                 c.t.o.values.data     = ptr(o);
+                 c.layout.offsets.data = ptr(cu_seqlens);
+                 if (c.s0) c.s0->data = ptr(initial_state);
+                 if (c.s1) c.s1->data = ptr(final_state);
+                 if (c.a_log) c.a_log->data = ptr(a_log);
+                 if (c.dt_bias) c.dt_bias->data = ptr(dt_bias);
+                 check(self.plan.execute(c.t, ptr(workspace), reinterpret_cast<cudaStream_t>(stream)));
+             });
     m.def("_kda_forward_config", [](py::dict tensors, py::dict options) {
         KdaCall call(tensors);
         std::string config;
@@ -166,19 +213,41 @@ init_ops_submodule(py::module_ &m) {
         return config;
     });
 
-    py::class_<SdpaForward>(m, "_SdpaForward")
+    py::class_<SdpaPrepared>(m, "_SdpaForward")
         .def("__init__",
-             [](SdpaForward *self, py::dict tensors, py::dict options) {
-                 SdpaCall call(tensors);
+             [](SdpaPrepared *self, py::dict tensors, py::dict options) {
+                 auto call = std::make_unique<SdpaCall>(tensors);
                  SdpaForward plan;
-                 check(SdpaForward::create(call.t, sdpa_options(options), KernelLibrary::registry(), plan));
-                 new (self) SdpaForward(std::move(plan));
+                 check(SdpaForward::create(call->t, sdpa_options(options), KernelLibrary::registry(), plan));
+                 new (self) SdpaPrepared{std::move(call), std::move(plan)};
              })
-        .def_prop_ro("workspace_size", &SdpaForward::workspace_size)
-        .def("execute", [](SdpaForward const &self, py::dict tensors, intptr_t workspace, intptr_t stream) {
-            SdpaCall call(tensors);
-            check(self.execute(call.t, reinterpret_cast<void *>(workspace), reinterpret_cast<cudaStream_t>(stream)));
-        });
+        .def_prop_ro("workspace_size", [](SdpaPrepared const &self) { return self.plan.workspace_size(); })
+        .def("execute",
+             [](SdpaPrepared const &self, py::dict tensors, intptr_t workspace, intptr_t stream) {
+                 SdpaCall call(tensors);
+                 check(self.plan.execute(call.t, ptr(workspace), reinterpret_cast<cudaStream_t>(stream)));
+             })
+        .def("execute_pointers",
+             [](SdpaPrepared &self,
+                intptr_t q,
+                intptr_t k,
+                intptr_t v,
+                intptr_t o,
+                intptr_t cu_seqlens_q,
+                intptr_t cu_seqlens_kv,
+                intptr_t stats,
+                intptr_t workspace,
+                intptr_t stream) {
+                 auto &c                  = *self.call;
+                 c.t.q.values.data        = ptr(q);
+                 c.t.k.values.data        = ptr(k);
+                 c.t.v.values.data        = ptr(v);
+                 c.t.o.values.data        = ptr(o);
+                 c.q_layout.offsets.data  = ptr(cu_seqlens_q);
+                 c.kv_layout.offsets.data = ptr(cu_seqlens_kv);
+                 if (c.stats) c.stats->data = ptr(stats);
+                 check(self.plan.execute(c.t, ptr(workspace), reinterpret_cast<cudaStream_t>(stream)));
+             });
     m.def("_sdpa_forward_config", [](py::dict tensors, py::dict options) {
         SdpaCall call(tensors);
         std::string config;

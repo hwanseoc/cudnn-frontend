@@ -36,13 +36,20 @@ def data_type(dtype):
 
 
 def call(plans, make_plan, tensors, options, device):
-    """Run the plan for these tensors' shapes (creating it once), on the current stream, with a fresh workspace."""
+    """Run the plan for these tensors' shapes (creating it once), on the current stream, with a fresh workspace.
+
+    ``tensors`` lists every operand of the op, None for an absent one, in the order the binding's
+    ``execute_pointers`` takes them."""
     import torch
 
-    descs = {name: describe(t) for name, t in tensors.items()}
-    key = (tuple((name, signature(d)) for name, d in descs.items()), tuple(sorted(options.items())))
+    key = (device.index, tuple(None if t is None else (t.dtype, t.shape, t.stride()) for t in tensors.values()), tuple(options.items()))
     plan = plans.get(key)
     if plan is None:
-        plan = plans.setdefault(key, make_plan(descs, options))
+        plan = plans.setdefault(key, make_plan({name: describe(t) for name, t in tensors.items()}, options))
+    from cudnn._torch_stream import _raw_current_stream
+
+    stream = _raw_current_stream(torch, device)  # ~0.1 us; torch.cuda.current_stream() builds a Stream (~2.5 us)
+    if stream is None:
+        stream = torch.cuda.current_stream(device).cuda_stream
     workspace = torch.empty(max(plan.workspace_size, 1), dtype=torch.uint8, device=device)
-    plan.execute(descs, workspace.data_ptr(), torch.cuda.current_stream(device).cuda_stream)
+    plan.execute_pointers(*(0 if t is None else t.data_ptr() for t in tensors.values()), workspace.data_ptr(), stream)

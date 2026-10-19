@@ -53,8 +53,7 @@ def kda_forward(
         state_dtype = initial_state.dtype if initial_state is not None else torch.float32
         final_state = torch.empty(n, HO, V, K, dtype=state_dtype, device=q.device)
     tensors = dict(q=q, k=k, v=v, g=g, beta=beta, o=o, cu_seqlens=cu_seqlens, initial_state=initial_state, final_state=final_state)
-    if safe_gate:
-        tensors.update(a_log=a_log, dt_bias=dt_bias)
+    tensors.update(a_log=a_log if safe_gate else None, dt_bias=dt_bias if safe_gate else None)
     options = dict(
         scale=scale,
         use_qk_l2norm=use_qk_l2norm,
