@@ -76,6 +76,6 @@ def build_sample(name, out_dir):
     return exe
 
 
-def run(cmd, **kwargs):
+def run(cmd, text=True, **kwargs):
     env = dict(os.environ, LD_LIBRARY_PATH=f"{cudnn_home()}/lib:{cuda_home()}/lib64:" + os.environ.get("LD_LIBRARY_PATH", ""))
-    return subprocess.run(cmd, capture_output=True, text=True, env=env, **kwargs)
+    return subprocess.run(cmd, capture_output=True, text=text, env=env, **kwargs)

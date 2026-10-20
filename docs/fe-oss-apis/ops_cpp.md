@@ -62,6 +62,7 @@ never a shape. `kernel_config()` returns the one a call needs; a failed `create(
 ```bash
 ./my_app --print-kernel-configs > configs.txt        # whatever kernel_config() returned
 python -m cudnn.ops configs.txt -o kernels.cudnn      # compile them for this GPU
+python -m cudnn.ops configs.txt -o - | ./my_app        # or as bytes on stdout, for KernelLibrary::load_bytes
 ```
 
 ```python
@@ -76,7 +77,7 @@ is refused when it is loaded. Its kernels link against `libtvm_ffi.so` and `libc
 found through the rpath recorded at compile time or through `LD_LIBRARY_PATH`. Writing a library
 links each kernel with the system C compiler. Linux only.
 
-`samples/ops/` runs both ops from Python and C++ against fp64 references.
+`samples/ops/` shows the three flows (Python compiles and executes; Python compiles and C++ executes from memory or from a file), each checked against an fp64 reference.
 
 ## Current limits
 

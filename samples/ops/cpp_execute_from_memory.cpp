@@ -3,14 +3,17 @@
  * SPDX-License-Identifier: MIT
  */
 
-// Kimi Delta Attention over three packed sequences of different lengths, from C++.
+// Python compiles, C++ executes from memory: Kimi Delta Attention forward over three packed sequences.
+// The library arrives as bytes (here on stdin, as it would from a compile service) and never touches disk.
 //
-//     kda_forward --config            print the kernel configuration this sample needs
-//     kda_forward kernels.cudnn       run it with kernels compiled by `python -m cudnn.ops`
+//     cpp_execute_from_memory --config > configs.txt                  the kernel configuration this sample needs
+//     python -m cudnn.ops configs.txt -o - | cpp_execute_from_memory  Python compiles, C++ loads the bytes and runs
 
 #include <cudnn_frontend/ops/kda_forward.h>
 
 #include <cstring>
+#include <iostream>
+#include <iterator>
 
 #include "reference.h"
 
@@ -57,13 +60,9 @@ main(int argc, char **argv) {
         std::printf("%s\n", config.c_str());
         return 0;
     }
-    if (argc != 2) {
-        std::fprintf(stderr, "usage: %s --config | %s <kernel library>\n", argv[0], argv[0]);
-        return 2;
-    }
-
+    std::string const blob((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
     ops::KernelLibrary library;
-    CHECK_FE(library.load_file(argv[1]));
+    CHECK_FE(library.load_bytes(blob.data(), blob.size()));
     ops::KdaForward plan;
     CHECK_FE(ops::KdaForward::create(tensors, options, library, plan));
     reference::Device<char> workspace(plan.workspace_size());

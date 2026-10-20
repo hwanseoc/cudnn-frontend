@@ -5,6 +5,7 @@
 
 import json
 import struct
+import subprocess
 import sys
 
 import pytest
@@ -14,7 +15,7 @@ from ops_test_utils import build_sample, requires_ops, run
 pytestmark = [pytest.mark.L0, requires_ops]
 
 
-SAMPLES = ("sdpa_forward", "sdpa_backward", "kda_forward", "kda_backward")
+SAMPLES = ("cpp_execute_from_file", "cpp_execute_from_memory", "sdpa_forward", "sdpa_backward", "kda_backward")
 
 
 @pytest.fixture(scope="module")
@@ -28,12 +29,23 @@ def samples(tmp_path_factory):
     return out, exes, configs
 
 
-@pytest.mark.parametrize("name", SAMPLES)
+@pytest.mark.parametrize("name", [name for name in SAMPLES if name != "cpp_execute_from_memory"])
 def test_cpp_sample_runs_from_a_library_file(samples, name):
     out, exes, _ = samples
     proc = run([exes[name], str(out / "kernels.cudnn")])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "rms error" in proc.stdout
+
+
+def test_cpp_sample_runs_from_library_bytes_on_a_pipe(samples):
+    """python -m cudnn.ops CONFIGS -o - | cpp_execute_from_memory: only the library reaches stdout."""
+    out, exes, configs = samples
+    (out / "memory.txt").write_text("\n".join(configs["cpp_execute_from_memory"]) + "\n")
+    compiled = subprocess.run([sys.executable, "-m", "cudnn.ops", str(out / "memory.txt"), "-o", "-"], capture_output=True)
+    assert compiled.returncode == 0, compiled.stderr.decode()
+    assert compiled.stdout.startswith(b"CUDNNOPS")
+    proc = run([exes["cpp_execute_from_memory"]], input=compiled.stdout, text=False)
+    assert proc.returncode == 0, (proc.stdout + proc.stderr).decode()
 
 
 def test_python_config_is_the_cpp_config(samples):
@@ -48,7 +60,7 @@ def test_missing_kernel_names_its_configuration(samples, tmp_path):
     from cudnn.ops import _library
 
     _, exes, configs = samples
-    _library.compile(configs["kda_forward"]).save(tmp_path / "kda_only.cudnn")  # no SDPA kernel in it
+    _library.compile(configs["cpp_execute_from_file"]).save(tmp_path / "kda_only.cudnn")  # no SDPA kernel in it
     proc = run([exes["sdpa_forward"], str(tmp_path / "kda_only.cudnn")])
     assert proc.returncode != 0
     assert configs["sdpa_forward"][0] in proc.stderr and "cudnn.ops.compile" in proc.stderr
